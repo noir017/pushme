@@ -1,0 +1,30 @@
+# 部署模板：复制到 <备份目录>/pushme/，同目录放 .env（chmod 600）和 data/（属主 65532）。
+#   mkdir -p data && sudo chown 65532:65532 data
+#   docker compose up -d
+name: pushme
+
+services:
+  pushme:
+    image: ghcr.io/noir017/pushme:latest
+    container_name: pushme
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      # 只绑部署机的内网 IP（在 .env 里设 PUSHME_BIND），别绑 0.0.0.0 暴露到公网。
+      - "${PUSHME_BIND:-127.0.0.1}:${PUSHME_PORT:-8290}:8080"
+    volumes:
+      - ./data:/data
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 64m
+    healthcheck:
+      test: ["CMD", "/pushme", "healthcheck"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
