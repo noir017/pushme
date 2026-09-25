@@ -143,11 +143,11 @@ func TestSendPlainAndJSON(t *testing.T) {
 	snd := &fakeSender{}
 	h := newTestServer(snd, &fakeQueue{}, nil)
 
-	rec, out := do(t, h, "POST", "/send", "", "Bearer tok-openwrt-0123456", "EasyTier 出现 1 个异常节点\n未知节点 10.192.168.77")
+	rec, out := do(t, h, "POST", "/send", "", "Bearer tok-openwrt-0123456", "EasyTier 出现 1 个异常节点\n未知节点 10.0.0.77")
 	if rec.Code != 200 || !strings.Contains(out, `"ok":true`) {
 		t.Fatalf("纯文本: %d %s", rec.Code, out)
 	}
-	if want := "[openwrt]\nEasyTier 出现 1 个异常节点\n未知节点 10.192.168.77"; snd.last() != want {
+	if want := "[openwrt]\nEasyTier 出现 1 个异常节点\n未知节点 10.0.0.77"; snd.last() != want {
 		t.Fatalf("got %q", snd.last())
 	}
 
