@@ -8,10 +8,13 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/noir017/pushme/internal/inbox"
 )
 
 var errTemp = errors.New("feishu down")
@@ -259,5 +262,132 @@ func TestHealthz(t *testing.T) {
 	rec, out := do(t, newTestServer(&fakeSender{}, q, nil), "GET", "/healthz", "", "", "")
 	if rec.Code != 200 || !strings.Contains(out, `"queued":1`) {
 		t.Fatalf("%d %s", rec.Code, out)
+	}
+}
+
+// ---- 收件箱 ----
+
+const recvTok = "Bearer tok-phone-0123456789"
+
+func newInboxServer(t *testing.T, sender *fakeSender, lim *Limiter) http.Handler {
+	t.Helper()
+	box, err := inbox.Open(filepath.Join(t.TempDir(), "inbox.json"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{
+		Tokens:    map[string]string{"tok-acme-0123456789": "acme", "tok-openwrt-0123456": "openwrt"},
+		Receivers: map[string]string{"tok-phone-0123456789": "phone"},
+		Sender:    sender,
+		Queue:     &fakeQueue{},
+		Inbox:     box,
+		Temporary: func(err error) bool { return errors.Is(err, errTemp) },
+		Limiter:   lim,
+		Log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	return s.Handler()
+}
+
+type inboxResp struct {
+	OK       bool
+	Messages []inbox.Message
+	Skipped  int
+	Cursor   int64
+}
+
+func getInbox(t *testing.T, h http.Handler, query string) inboxResp {
+	t.Helper()
+	rec, out := do(t, h, "GET", "/inbox"+query, "", recvTok, "")
+	if rec.Code != 200 {
+		t.Fatalf("GET /inbox%s: %d %s", query, rec.Code, out)
+	}
+	var r inboxResp
+	if err := json.Unmarshal([]byte(out), &r); err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+func TestInboxDisabledByDefault(t *testing.T) {
+	rec, _ := do(t, newTestServer(&fakeSender{}, &fakeQueue{}, nil), "GET", "/inbox?after=0", "", recvTok, "")
+	if rec.Code != 404 {
+		t.Fatalf("没配收件箱应 404，实际 %d", rec.Code)
+	}
+}
+
+func TestInboxAuth(t *testing.T) {
+	h := newInboxServer(t, &fakeSender{}, nil)
+	for _, auth := range []string{"", "Bearer wrong", "Bearer tok-openwrt-0123456"} {
+		if rec, _ := do(t, h, "GET", "/inbox?after=0", "", auth, ""); rec.Code != 401 {
+			t.Fatalf("auth %q 应 401（调用方 token 读不了收件箱），实际 %d", auth, rec.Code)
+		}
+	}
+	if rec, _ := do(t, h, "POST", "/send", "", recvTok, "x"); rec.Code != 401 {
+		t.Fatalf("接收方 token 不能发消息，实际 %d", rec.Code)
+	}
+}
+
+func TestInboxGetsAcceptedMessages(t *testing.T) {
+	h := newInboxServer(t, &fakeSender{}, nil)
+	if r := getInbox(t, h, ""); len(r.Messages) != 0 || r.Cursor != 0 {
+		t.Fatalf("空收件箱: %+v", r)
+	}
+	do(t, h, "POST", "/send", "application/json", "Bearer tok-openwrt-0123456", `{"title":"备份失败","text":"exit 23\n"}`)
+	do(t, h, "POST", "/hook/tok-acme-0123456789", "application/json", "", `{"msg_type":"text","content":{"text":"Renew success"}}`)
+
+	r := getInbox(t, h, "?after=0")
+	if len(r.Messages) != 2 || r.Cursor != 2 || r.Skipped != 0 {
+		t.Fatalf("%+v", r)
+	}
+	if m := r.Messages[0]; m.Seq != 1 || m.Caller != "openwrt" || m.Title != "备份失败" || m.Text != "exit 23" || m.TS == 0 {
+		t.Fatalf("标题、正文应分开存，调用方不进正文：%+v", m)
+	}
+	if m := r.Messages[1]; m.Caller != "acme" || m.Title != "" || m.Text != "Renew success" {
+		t.Fatalf("%+v", m)
+	}
+	// 不带 after：不回放历史，只给当前序号
+	if r := getInbox(t, h, ""); len(r.Messages) != 0 || r.Cursor != 2 {
+		t.Fatalf("%+v", r)
+	}
+	if r := getInbox(t, h, "?after=0&limit=1"); len(r.Messages) != 1 || r.Messages[0].Seq != 2 || r.Skipped != 1 {
+		t.Fatalf("limit 应取最新的：%+v", r)
+	}
+}
+
+func TestInboxIndependentOfFeishu(t *testing.T) {
+	h := newInboxServer(t, &fakeSender{err: errPerm}, nil)
+	if rec, _ := do(t, h, "POST", "/send", "", "Bearer tok-openwrt-0123456", "飞书拒收"); rec.Code != 502 {
+		t.Fatalf("飞书永久失败照旧 502，实际 %d", rec.Code)
+	}
+	if r := getInbox(t, h, "?after=0"); len(r.Messages) != 1 || r.Messages[0].Text != "飞书拒收" {
+		t.Fatalf("飞书发不出去，App 也该收到：%+v", r)
+	}
+}
+
+func TestInboxSkipsRateLimitedButGetsNotice(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	lim := &Limiter{Burst: 1, Window: 10 * time.Minute, Now: func() time.Time { return now }}
+	h := newInboxServer(t, &fakeSender{}, lim)
+	do(t, h, "POST", "/send", "", "Bearer tok-openwrt-0123456", "第一条")
+	if rec, _ := do(t, h, "POST", "/send", "", "Bearer tok-openwrt-0123456", "被限流"); rec.Code != 429 {
+		t.Fatalf("应 429，实际 %d", rec.Code)
+	}
+	r := getInbox(t, h, "?after=0")
+	if len(r.Messages) != 2 || r.Messages[0].Text != "第一条" || r.Messages[1].Caller != "pushme" || r.Messages[1].Title != "限流" {
+		t.Fatalf("被限流的不进收件箱，限流提醒要进：%+v", r)
+	}
+}
+
+func TestInboxLongPollWakesOnNewMessage(t *testing.T) {
+	h := newInboxServer(t, &fakeSender{}, nil)
+	done := make(chan string)
+	start := time.Now()
+	go func() { _, out := do(t, h, "GET", "/inbox?after=0&wait=10", "", recvTok, ""); done <- out }()
+	time.Sleep(50 * time.Millisecond)
+	do(t, h, "POST", "/send", "", "Bearer tok-openwrt-0123456", "来了")
+	var r inboxResp
+	_ = json.Unmarshal([]byte(<-done), &r)
+	if time.Since(start) > 3*time.Second || len(r.Messages) != 1 || r.Cursor != 1 {
+		t.Fatalf("应一来消息就返回：%v %+v", time.Since(start), r)
 	}
 }

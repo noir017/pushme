@@ -6,6 +6,7 @@
 - **兼容飞书自定义机器人的 webhook 格式**：本来就支持「飞书 webhook」的工具（acme.sh 的 `feishu` 通知钩子、很多监控系统）只要把 URL 换成 pushme 的，不用改代码。
 - 每个调用方一个 token：消息自动加 `[调用方]` 前缀，可单独吊销，单独限流。
 - 飞书暂时发不出去时，消息写入本地队列并按退避重试，最多重试 24 小时，调用方不必自己处理重试。
+- 可选的**收件箱**：每条消息另存一份，手机 App 长轮询 `GET /inbox` 收、直接弹通知（例如 AutoAnything 的「aa助手」），不经飞书。
 - Go 标准库，零依赖；镜像约 10MB（distroless），内存 < 20MB；amd64 / arm64。
 
 ## 接口
@@ -34,6 +35,25 @@ curl -m 10 -s -H "Authorization: Bearer $PUSHME_TOKEN" -H 'Content-Type: applica
 
 响应与飞书一致：`{"code":0,"msg":"success","StatusCode":0,"StatusMessage":"success","data":{…}}`。
 请求里带的 `timestamp`/`sign` 会被忽略：URL 里的 token 本身就是凭据。
+
+### `GET /inbox`：收件箱（手机 App 收消息）
+
+配了 `PUSHME_RECEIVERS` 才有（否则 404）。每条被受理的消息（被限流的除外）按到达顺序编号存一份，只留最近 200 条；
+与飞书发没发成功无关。鉴权用**接收方** token，调用方的 token 读不了。
+
+```sh
+curl -m 70 -s -H "Authorization: Bearer $RECEIVER_TOKEN" "http://<host>:8290/inbox?after=41&wait=50&limit=20"
+```
+
+```json
+{"ok":true,"messages":[{"seq":42,"ts":1791234567,"caller":"openwrt","title":"备份失败","text":"exit 23"}],"skipped":0,"cursor":42}
+```
+
+- 返回序号大于 `after` 的消息里**最新的** `limit` 条（默认 20，最多 100），按序号升序；`skipped` 是因此没返回的较早条数（含已被丢弃的）。
+- 没有新消息时最多挂 `wait` 秒（最多 60），一来新消息立即返回。
+- 下次请求把 `after` 设成响应里的 `cursor`。不带 `after`（或为负）时不回放历史，立即返回当前 `cursor`，第一次连上时用。
+- `after` 比 `cursor` 还大说明收件箱被清空过，这时从头返回现存的消息。
+- `title` / `text` 分开给，不带 `[调用方]` 前缀（调用方在 `caller` 里）。
 
 ### `GET /healthz`
 
@@ -88,12 +108,13 @@ docker compose up -d && docker compose logs -f
 | `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | ✓ | 飞书开放平台自建应用的凭据，应用需开通机器人能力和发消息权限 |
 | `PUSHME_TO` | ✓ | 收件人：`user:ou_xxx` / `chat:oc_xxx` / `email:xxx`。调用方不能指定收件人 |
 | `PUSHME_TOKENS` | ✓ | `name:token,name:token`；token 至少 16 位，建议 `openssl rand -hex 24` |
+| `PUSHME_RECEIVERS` | | 收件箱的接收方，格式同上，token 不能与调用方重复；留空不开收件箱 |
 | `PUSHME_RATE` | | 每个调用方的限流，默认 `30/10m` |
 | `PUSHME_LISTEN` | | 容器内监听地址，默认 `:8080` |
-| `PUSHME_DATA` | | 重试队列所在目录，默认 `/data` |
+| `PUSHME_DATA` | | 重试队列与收件箱所在目录，默认 `/data` |
 | `PUSHME_BIND` / `PUSHME_PORT` | | 只给 compose 插值用：宿主机绑定的 IP 与端口 |
 
-新增调用方：往 `PUSHME_TOKENS` 加一项，然后 `docker compose up -d`。吊销调用方：删掉那一项，同样重启。
+新增调用方：往 `PUSHME_TOKENS` 加一项，然后 `docker compose up -d`。吊销调用方：删掉那一项，同样重启。接收方同理（`PUSHME_RECEIVERS`）。
 
 ### 更新
 
@@ -107,7 +128,7 @@ docker compose pull && docker compose up -d
 
 - 只打算在内网用：compose 模板默认绑 `127.0.0.1`，应改成部署机的内网 IP，**别绑 0.0.0.0 暴露到公网**。
 - token 放在 `/hook/{token}` 的 URL 里（为了兼容飞书 webhook 格式），会出现在调用方的配置里。要是经过会记录 URL 的反向代理，请关掉这一路径的 access log。
-- 日志只记调用方、字节数、结果和飞书 message_id，不记消息正文。
+- 日志只记调用方、字节数、结果和飞书 message_id，不记消息正文。收件箱（`data/inbox.json`）存了正文，和 `.env` 一样别外传。
 
 ## 开发
 
