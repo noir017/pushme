@@ -2,9 +2,11 @@
 //
 //	POST /hook/{token}  飞书自定义机器人兼容入口（acme.sh 的 feishu 钩子、quantlab 的 webhook 通道零改动接入）
 //	POST /send          原生入口：Authorization: Bearer <token>；body 为纯文本，或 JSON {"title","text"}
+//	GET  /inbox         收件箱长轮询（手机 App 收消息）：Authorization: Bearer <接收方 token>
 //	GET  /healthz
 //
 // 每个 token 对应一个调用方名，消息前自动加「[调用方]」；收件人固定，调用方不能指定。
+// 开了收件箱时，受理的每条消息（过了限流的）另存一份，供手机 App 取走，与飞书是否发成功无关。
 package server
 
 import (
@@ -20,12 +22,19 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	"github.com/noir017/pushme/internal/inbox"
 )
 
 const (
 	maxBody = 64 << 10
 	// 飞书文本消息体上限约 150KB；个人告警远用不到，截断以免整条被拒。
 	maxText = 20000
+
+	// 收件箱长轮询单次最长挂起秒数，与每次最多返回的条数
+	maxInboxWait  = 60
+	defInboxLimit = 20
+	maxInboxLimit = 100
 )
 
 // Sender 真正把一条文本发出去（生产环境是飞书客户端）。
@@ -41,8 +50,10 @@ type Queue interface {
 
 type Server struct {
 	Tokens    map[string]string // token → 调用方名
+	Receivers map[string]string // token → 接收方名（只能读收件箱，不能发）
 	Sender    Sender
 	Queue     Queue
+	Inbox     *inbox.Inbox // nil 表示不开收件箱
 	Temporary func(error) bool
 	Limiter   *Limiter
 	Log       *slog.Logger
@@ -54,6 +65,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", s.healthz)
 	mux.HandleFunc("POST /hook/{token}", s.hook)
 	mux.HandleFunc("POST /send", s.send)
+	mux.HandleFunc("GET /inbox", s.inbox)
 	return mux
 }
 
@@ -216,6 +228,61 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+// ---- 收件箱 ----
+
+// inbox 返回序号大于 after 的消息里最新的至多 limit 条。没有就最多挂 wait 秒，一来新消息立即返回。
+// 响应 {"ok":true,"messages":[…],"skipped":较早没返回的条数,"cursor":下次的 after}。
+// after 缺省或为负：不回放历史，立即返回当前的 cursor（App 第一次连上时用）。
+func (s *Server) inbox(w http.ResponseWriter, r *http.Request) {
+	if s.Inbox == nil || len(s.Receivers) == 0 {
+		writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "error": "inbox disabled"})
+		return
+	}
+	tok, found := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	receiver, ok := s.Receivers[strings.TrimSpace(tok)]
+	if !found || !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"ok": false, "error": "missing or invalid bearer token"})
+		return
+	}
+	q := r.URL.Query()
+	after, err := strconv.ParseInt(q.Get("after"), 10, 64)
+	if err != nil {
+		after = -1
+	}
+	if after < 0 {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "messages": []inbox.Message{}, "skipped": 0, "cursor": s.Inbox.Latest()})
+		return
+	}
+	wait, _ := strconv.Atoi(q.Get("wait"))
+	wait = min(max(wait, 0), maxInboxWait)
+	limit, err := strconv.Atoi(q.Get("limit"))
+	if err != nil || limit <= 0 {
+		limit = defInboxLimit
+	}
+	limit = min(limit, maxInboxLimit)
+
+	if wait > 0 {
+		// http.Server 的 WriteTimeout 比长轮询短，这一个请求单独放宽
+		_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(time.Duration(wait+10) * time.Second))
+		s.Inbox.Wait(r.Context(), after, time.Duration(wait)*time.Second)
+	}
+	msgs, skipped, latest := s.Inbox.After(after, limit)
+	if len(msgs) > 0 || skipped > 0 {
+		s.log().Info("inbox delivered", "receiver", receiver, "count", len(msgs), "skipped", skipped, "cursor", latest)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "messages": msgs, "skipped": skipped, "cursor": latest})
+}
+
+// toInbox 给收件箱存一份。落盘失败只记日志：内存里已经有了，App 照样收得到。
+func (s *Server) toInbox(caller, title, text string) {
+	if s.Inbox == nil {
+		return
+	}
+	if _, err := s.Inbox.Add(caller, strings.TrimSpace(title), truncate(strings.TrimRight(text, "\n"))); err != nil {
+		s.log().Error("inbox save failed", "caller", caller, "err", err)
+	}
+}
+
 // ---- 公共投递逻辑 ----
 
 type result struct {
@@ -238,15 +305,19 @@ func format(caller, title, text string) string {
 	if t := strings.TrimRight(text, "\n"); strings.TrimSpace(t) != "" {
 		b.WriteString("\n" + t)
 	}
-	out := b.String()
-	if len(out) > maxText {
-		cut := maxText
-		for cut > 0 && !utf8.RuneStart(out[cut]) {
-			cut--
-		}
-		out = out[:cut] + "\n…（已截断）"
+	return truncate(b.String())
+}
+
+// truncate 把超过 maxText 字节的文本在字符边界处截断。
+func truncate(s string) string {
+	if len(s) <= maxText {
+		return s
 	}
-	return out
+	cut := maxText
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "\n…（已截断）"
 }
 
 func (s *Server) deliver(ctx context.Context, caller, title, text string) result {
@@ -257,14 +328,18 @@ func (s *Server) deliver(ctx context.Context, caller, title, text string) result
 		allowed, notify := s.Limiter.Allow(caller)
 		if notify {
 			// 限流通知本身不过限流器，每个调用方每个窗口最多一条。
-			go s.sendDetached("pushme", format("pushme", "限流", "调用方 "+caller+" 在 "+
-				s.Limiter.Window.String()+" 内超过 "+strconv.Itoa(s.Limiter.Burst)+" 条，后续消息被丢弃直到窗口恢复。"))
+			note := "调用方 " + caller + " 在 " + s.Limiter.Window.String() + " 内超过 " +
+				strconv.Itoa(s.Limiter.Burst) + " 条，后续消息被丢弃直到窗口恢复。"
+			s.toInbox("pushme", "限流", note)
+			go s.sendDetached("pushme", format("pushme", "限流", note))
 		}
 		if !allowed {
 			lg.Warn("rate limited")
 			return result{status: http.StatusTooManyRequests, err: "rate limited"}
 		}
 	}
+	// 先存收件箱再发飞书：App 不用等飞书（最慢要等到 Timeout）
+	s.toInbox(caller, title, text)
 
 	timeout := s.Timeout
 	if timeout <= 0 {
