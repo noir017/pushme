@@ -100,6 +100,8 @@ token 只从环境变量读（不出现在进程参数里）。等待中连不�
 
 **配对**：手机公钥是 PEM（`-----BEGIN PUBLIC KEY-----`，SubjectPublicKeyInfo）。装到宿主后用 `pushme fingerprint approver.pub` 打印指纹（SubjectPublicKeyInfo DER 的 SHA-256 前 8 字节，如 `ab12 cd34 ef56 7890`），和 App 上显示的核对。**这一步要人自己做**：谁替你传公钥，谁就能换成他的。
 
+**手机 App** 在 [`android/`](android/README.md)：收消息、审批。CI 只出未签名的包，签名在你自己的机器上做。
+
 ### `GET /healthz`
 
 返回 `{"ok":true,"queued":<队列长度>}`。

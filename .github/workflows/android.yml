@@ -1,0 +1,57 @@
+# 手机 App（android/）：编译出**未签名**的 release 包，作为 Actions 产物保留。
+#
+# 签名密钥不进 CI：仓库谁都可能推代码，CI 能签名就等于谁都能出一个能覆盖安装的新版审批器。
+# 正式包由人下载这里的产物，在自己的机器上用 apksigner 签名后安装（见 android/README.md）。
+# versionCode 取本 workflow 的运行序号，只增不减，签好的包才能覆盖升级。
+
+name: Android
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'android/**'
+      - '.github/workflows/android.yml'
+  pull_request:
+    paths:
+      - 'android/**'
+      - '.github/workflows/android.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+      - name: assembleRelease（未签名）
+        working-directory: android
+        env:
+          VERSION_CODE: ${{ github.run_number }}
+          VERSION_NAME: 0.1.${{ github.run_number }}
+        run: gradle --no-daemon assembleRelease
+      - name: 记下摘要
+        run: |
+          cd android/app/build/outputs/apk/release
+          mv app-release-unsigned.apk pushme-0.1.${{ github.run_number }}-unsigned.apk
+          sha256sum *.apk | tee SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pushme-0.1.${{ github.run_number }}-unsigned
+          path: |
+            android/app/build/outputs/apk/release/*.apk
+            android/app/build/outputs/apk/release/SHA256SUMS
+          if-no-files-found: error
