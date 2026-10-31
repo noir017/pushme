@@ -2,108 +2,96 @@ package io.github.noir017.pushme
 
 import android.Manifest
 import android.app.Activity
-import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.graphics.Typeface
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.os.PowerManager
-import android.provider.Settings
-import android.text.InputType
-import android.view.ViewGroup
-import android.widget.Button
-import android.widget.EditText
+import android.text.TextUtils
+import android.view.Gravity
+import android.view.View
 import android.widget.LinearLayout
-import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import java.time.Instant
+import java.time.LocalDate
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import java.util.concurrent.Executors
 
 /**
- * 主界面：填 pushme 地址与接收方 token、看连接状态；生成审批密钥、导出公钥配对；待审批、主动授权入口；常用权限设置。
+ * 主页：连接状态、待审批（点开去审批）、主动授权入口、最近的消息。地址、token、密钥、权限在 [SettingsActivity]。
+ *
+ * 在前台时每几秒查一次待审批和新消息；有没自动弹过的待审批就直接打开审批页（通知不一定弹得出来，进 App 就能处理）。
+ * 待审批的正文只在审批页（禁截屏）里显示，主页和消息列表只露标题。
  */
 class MainActivity : Activity() {
 
     private val main = Handler(Looper.getMainLooper())
     private val io = Executors.newSingleThreadExecutor()
     private lateinit var prefs: Prefs
-    private lateinit var statusView: TextView
-    private lateinit var urlEdit: EditText
-    private lateinit var tokenEdit: EditText
-    private lateinit var keyView: TextView
-    private lateinit var keyButton: Button
+    private lateinit var ui: Ui
+    private lateinit var status: Ui.StatusLine
+    private lateinit var setupBox: LinearLayout
+    private lateinit var pendingBox: LinearLayout
+    private lateinit var grantEntry: View
+    private lateinit var messageBox: LinearLayout
 
-    /** 在前台时多久查一次待审批；有新的就自动打开审批页（通知不一定弹得出来，进 App 就能处理）。 */
-    private var lastPendingCheck = 0L
-    private var checkingPending = false
+    private var pending: List<Approval> = emptyList()
+
+    /** 待审批卡片上的倒计时，每秒刷新。 */
+    private val countdowns = ArrayList<Pair<Approval, TextView>>()
+
+    /** 服务器时间减本机时间（毫秒）。 */
+    private var offsetMs = 0L
+
+    /** 最近的消息，新的在前。[seenSeq] 是已取到的序号，[seenFrom] 是取它们时的地址和 token（换了收件箱就从头取）。 */
+    private val messages = ArrayList<InboxMessage>()
+    private var seenSeq = 0L
+    private var seenFrom = ""
+    private var messageError: String? = null
+    private val expanded = HashSet<Long>()
+
+    private var lastRefresh = 0L
+    private var refreshing = false
 
     private val tick = object : Runnable {
         override fun run() {
-            statusView.text = "状态：${PushService.status}"
-            if (System.currentTimeMillis() - lastPendingCheck >= PENDING_EVERY_MS) checkPending()
+            renderStatus()
+            renderCountdowns()
+            if (System.currentTimeMillis() - lastRefresh >= REFRESH_EVERY_MS) refresh()
             main.postDelayed(this, 1_000)
         }
     }
 
-    private val density by lazy { resources.displayMetrics.density }
-    private fun dp(value: Int) = (value * density).toInt()
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         prefs = Prefs(this)
-        statusView = TextView(this).apply { textSize = 15f }
-        urlEdit = EditText(this).apply {
-            hint = "pushme 地址，如 https://pushme.lan.noharanas.eu.org"
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
-            setText(prefs.url)
-        }
-        tokenEdit = EditText(this).apply {
-            hint = "接收方 token（PUSHME_RECEIVERS 里的一项）"
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-            setText(prefs.token)
-        }
-        keyView = TextView(this).apply {
-            textSize = 14f
-            setTextIsSelectable(true)
-        }
-        keyButton = button("") { confirmGenerate() }
+        ui = Ui(this)
+        status = ui.StatusLine()
+        setupBox = ui.column()
+        pendingBox = ui.column()
+        messageBox = ui.column(gap = 8)
+        grantEntry = ui.card(
+            ui.row(
+                ui.column(ui.label("主动授权", 16f, bold = true), ui.label("不等申请，直接给 agent 开提权，或全部收回", 13f, ui.muted), gap = 2),
+                ui.label("›", 24f, ui.muted),
+                weights = listOf(1f, 0f),
+            ),
+            onClick = { startActivity(Intent(this, GrantActivity::class.java)) },
+        )
+        val body = ui.column(ui.card(status.view, onClick = { openSettings() }))
+        ui.add(body, setupBox)
+        ui.add(body, pendingBox)
+        ui.add(body, grantEntry, top = 12)
+        ui.add(body, ui.header("最近消息"))
+        ui.add(body, messageBox)
+        ui.screen("pushme", body, back = false, action = ui.button("设置", Btn.TEXT) { openSettings() })
+        renderMessages()
 
-        val layout = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(16), dp(16), dp(24))
-            addView(statusView)
-            addView(row(
-                button("查看待审批") { startActivity(ApprovalActivity.intent(this@MainActivity, null)) },
-                button("主动授权") { startActivity(android.content.Intent(this@MainActivity, GrantActivity::class.java)) },
-            ))
-
-            addView(section("连接"))
-            addView(urlEdit)
-            addView(tokenEdit)
-            addView(row(button("保存并连接") { save() }, button("停止服务") { stopService(Intent(this@MainActivity, PushService::class.java)) }))
-
-            addView(section("审批密钥"))
-            addView(keyView)
-            addView(row(keyButton))
-            addView(row(button("复制公钥") { copyPublicKey() }, button("分享公钥") { sharePublicKey() }))
-            addView(note("配对：把公钥装到发起审批的机器上，再核对两边显示的指纹一致。这一步要你自己做，别让别人代传公钥。"))
-
-            addView(section("权限"))
-            addView(row(button("允许通知") { requestNotifications() }, button("不限制后台耗电") { requestIgnoreBattery() }))
-            addView(note("小米 / HyperOS：另在系统设置里给 pushme 打开「自启动」，并在通知设置里给「审批」「消息」打开悬浮通知。"))
-
-            addView(note("版本 " + packageManager.getPackageInfo(packageName, 0).versionName))
-        }
-        setContentView(ScrollView(this).apply {
-            fitsSystemWindows = true
-            addView(layout)
-        })
-        renderKey()
         if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
         }
@@ -112,26 +100,9 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
-        lastPendingCheck = 0 // 回到前台立刻查一次
+        renderSetup()
+        lastRefresh = 0 // 回到前台立刻查一次
         main.post(tick)
-    }
-
-    /** 有还没自动弹过的待审批就打开审批页。同一条只自动弹一次：你退出来不会反复弹，要处理就点「查看待审批」。 */
-    private fun checkPending() {
-        lastPendingCheck = System.currentTimeMillis()
-        if (!prefs.configured || checkingPending) return
-        checkingPending = true
-        val client = PushmeClient(prefs.url, prefs.token)
-        io.execute {
-            val first = runCatching { client.pending().approvals }.getOrNull()?.firstOrNull { it.id !in autoOpened }
-            main.post {
-                checkingPending = false
-                if (first != null && !isFinishing && hasWindowFocus()) {
-                    autoOpened.add(first.id)
-                    startActivity(ApprovalActivity.intent(this, first.id))
-                }
-            }
-        }
     }
 
     override fun onPause() {
@@ -139,119 +110,204 @@ class MainActivity : Activity() {
         super.onPause()
     }
 
-    private fun save() {
-        val url = urlEdit.text.toString().trim().trimEnd('/')
-        val token = tokenEdit.text.toString().trim()
-        if (!url.startsWith("http://") && !url.startsWith("https://")) {
-            toast("地址要以 http:// 或 https:// 开头")
-            return
-        }
-        if (token.length < 16) {
-            toast("token 至少 16 位")
-            return
-        }
-        if (url != prefs.url || token != prefs.token) {
-            prefs.url = url
-            prefs.token = token
-            prefs.cursor = -1 // 换了收件箱：从它当前的序号收起，不回放历史
-            stopService(Intent(this, PushService::class.java)) // 让服务按新配置重连
-        }
-        PushService.start(this)
-        toast("已保存")
+    override fun onDestroy() {
+        io.shutdownNow()
+        super.onDestroy()
     }
 
-    private fun renderKey() {
-        val fp = runCatching { Approver.fingerprint() }.getOrNull()
-        keyView.text = if (fp == null) "还没有密钥：生成后才能批准审批。需要先设好锁屏密码。" else "公钥指纹：$fp"
-        keyButton.text = if (fp == null) "生成密钥" else "重新生成密钥"
+    private fun openSettings() = startActivity(Intent(this, SettingsActivity::class.java))
+
+    private fun renderStatus() {
+        val link = PushService.link
+        val host = runCatching { Uri.parse(prefs.url).host }.getOrNull()
+        status.set(ui.linkTone(link), if (link == PushService.Link.ONLINE && host != null) "${PushService.status} · $host" else PushService.status)
     }
 
-    private fun confirmGenerate() {
-        if (!Approver.hasKey()) {
-            generate()
+    /** 没配好时的引导：先连上 pushme，再生成密钥。 */
+    private fun renderSetup() {
+        setupBox.removeAllViews()
+        grantEntry.visibility = if (prefs.configured) View.VISIBLE else View.GONE
+        val hasKey = runCatching { Approver.hasKey() }.getOrDefault(false)
+        val (title, text, action) = when {
+            !prefs.configured -> Triple("先连上 pushme", "填好 pushme 地址和接收方 token，才能收消息、做审批。", "去设置")
+            !hasKey -> Triple("还没有审批密钥", "生成密钥、把公钥装到发起审批的机器上，才能批准审批和主动授权。", "去生成")
+            else -> return
+        }
+        ui.add(setupBox, ui.card(
+            ui.label(title, 17f, bold = true),
+            ui.label(text, 14f, ui.muted),
+            ui.button(action) { openSettings() },
+            gap = 10,
+            stroke = ui.alpha(ui.primary, 0x80),
+        ), top = 12)
+    }
+
+    /** 取待审批和新消息。有没自动弹过的待审批就打开审批页：同一条只自动弹一次，你退出来不会反复弹。 */
+    private fun refresh() {
+        lastRefresh = System.currentTimeMillis()
+        if (!prefs.configured) {
+            if (seenFrom.isNotEmpty() || pending.isNotEmpty()) {
+                pending = emptyList()
+                messages.clear()
+                seenFrom = ""
+                messageError = null
+                renderPending()
+                renderMessages()
+            }
             return
         }
-        AlertDialog.Builder(this)
-            .setTitle("重新生成密钥？")
-            .setMessage("旧密钥会被删除，之前配对过的机器都要重新装公钥，否则验不过你的批准。")
-            .setPositiveButton("重新生成") { _, _ -> generate() }
-            .setNegativeButton("取消", null)
-            .show()
-    }
-
-    private fun generate() {
-        keyButton.isEnabled = false
+        if (refreshing) return
+        refreshing = true
+        val client = PushmeClient(prefs.url, prefs.token)
+        val from = prefs.url + " " + prefs.token
+        val after = if (from == seenFrom) seenSeq else 0
         io.execute {
-            val result = runCatching { Approver.generate() }
+            val p = runCatching { client.pending() }
+            val batch = runCatching { client.inbox(after, 0, HISTORY) }
             main.post {
-                keyButton.isEnabled = true
-                result.onSuccess { strongBox -> toast(if (strongBox) "已生成（在安全芯片里）" else "已生成（手机没有安全芯片，放在系统密钥库）") }
-                    .onFailure { toast("生成失败：${it.message ?: it.javaClass.simpleName}（先在系统设置里设好锁屏密码）") }
-                renderKey()
+                refreshing = false
+                if (isDestroyed) return@post
+                p.onSuccess {
+                    offsetMs = if (it.now > 0) it.now * 1000 - System.currentTimeMillis() else 0
+                    if (it.approvals.map { a -> a.id } != pending.map { a -> a.id }) {
+                        pending = it.approvals
+                        renderPending()
+                    }
+                    autoOpen()
+                }
+                batch.onSuccess { b ->
+                    // 换了收件箱，或者收件箱被清空过（序号倒退，服务器从头返回）
+                    val reset = from != seenFrom || b.cursor < seenSeq
+                    if (reset) {
+                        messages.clear()
+                        expanded.clear()
+                    }
+                    seenFrom = from
+                    seenSeq = b.cursor
+                    messages.addAll(0, b.messages.asReversed())
+                    while (messages.size > HISTORY) messages.removeAt(messages.lastIndex)
+                    if (reset || b.messages.isNotEmpty() || messageError != null) {
+                        messageError = null
+                        renderMessages()
+                    }
+                }.onFailure {
+                    val error = PushmeClient.describe(it)
+                    if (error != messageError) {
+                        messageError = error
+                        renderMessages()
+                    }
+                }
             }
         }
     }
 
-    private fun copyPublicKey() {
-        val pem = Approver.publicKeyPem() ?: return toast("还没有密钥")
-        getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("pushme 公钥", pem))
-        toast("已复制公钥，指纹 ${Approver.fingerprint()}")
+    private fun autoOpen() {
+        val first = pending.firstOrNull { it.id !in autoOpened } ?: return
+        if (isFinishing || !hasWindowFocus()) return
+        autoOpened.add(first.id)
+        startActivity(ApprovalActivity.intent(this, first.id))
     }
 
-    private fun sharePublicKey() {
-        val pem = Approver.publicKeyPem() ?: return toast("还没有密钥")
-        val send = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, pem)
-        startActivity(Intent.createChooser(send, "分享公钥"))
+    private fun renderPending() {
+        pendingBox.removeAllViews()
+        countdowns.clear()
+        if (pending.isEmpty()) return
+        ui.add(pendingBox, ui.header("待审批 · ${pending.size}"))
+        pending.forEachIndexed { i, a ->
+            val left = ui.label(size = 13f, color = ui.warn, bold = true)
+            countdowns.add(a to left)
+            ui.add(pendingBox, ui.card(
+                ui.row(ui.label("来自 ${a.caller}", 13f, ui.muted), left, weights = listOf(1f, 0f)),
+                ui.row(ui.label(a.title.ifBlank { "（无标题）" }, 17f, bold = true), ui.label("›", 24f, ui.muted), weights = listOf(1f, 0f)),
+                gap = 4,
+                stroke = ui.alpha(ui.warn, 0x99),
+                onClick = { startActivity(ApprovalActivity.intent(this, a.id)) },
+            ), top = if (i > 0) 8 else 0)
+        }
+        renderCountdowns()
     }
 
-    private fun requestNotifications() {
-        if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) {
-            startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, packageName))
-        } else {
-            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+    private fun renderCountdowns() {
+        for ((a, view) in countdowns) {
+            val s = (a.expires * 1000 - offsetMs - System.currentTimeMillis()) / 1000
+            view.text = if (s <= 0) "已过期" else "还剩 %d:%02d".format(s / 60, s % 60)
         }
     }
 
-    private fun requestIgnoreBattery() {
-        if (getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)) {
-            toast("已经不受电池优化限制")
+    private fun renderMessages() {
+        messageBox.removeAllViews()
+        val error = messageError
+        if (error != null) {
+            messageBox.addView(ui.notice().also { ui.say(it, Tone.BAD, "取消息失败：$error") })
+        }
+        if (messages.isEmpty()) {
+            val note = when {
+                !prefs.configured -> "连上 pushme 后，这里显示最近的消息"
+                error != null -> return
+                seenFrom.isEmpty() -> "加载中…"
+                else -> "还没有消息"
+            }
+            messageBox.addView(ui.label(note, 14f, ui.muted).apply {
+                gravity = Gravity.CENTER
+                setPadding(0, ui.dp(32), 0, ui.dp(32))
+            })
             return
         }
-        startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
+        for (m in messages) ui.add(messageBox, messageCard(m), top = if (messageBox.childCount > 0) 8 else 0)
     }
 
-    private fun button(label: String, onClick: () -> Unit) = Button(this).apply {
-        text = label
-        isAllCaps = false
-        setOnClickListener { onClick() }
+    /** 一条消息：调用方、时间、标题、正文（长的先折起来，点一下展开）；长按复制。待审批的只露标题。 */
+    private fun messageCard(m: InboxMessage): View {
+        val isApproval = m.approvalId != null
+        val views = mutableListOf<View>(ui.row(
+            ui.label(if (isApproval) "${m.caller} · 审批" else m.caller, 13f, if (isApproval) ui.warn else ui.muted, bold = true),
+            ui.label(timeText(m.ts), 12f, ui.muted),
+            weights = listOf(1f, 0f),
+        ))
+        if (m.title.isNotBlank()) views += ui.label(m.title, 16f, bold = true)
+        val textView = if (isApproval || m.text.isBlank()) null else ui.label(m.text, 15f).apply {
+            maxLines = if (m.seq in expanded) Int.MAX_VALUE else COLLAPSED_LINES
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        if (textView != null) views += textView
+        return ui.card(*views.toTypedArray(), gap = 4, onClick = {
+            if (textView != null) {
+                val open = m.seq !in expanded
+                if (open) expanded.add(m.seq) else expanded.remove(m.seq)
+                textView.maxLines = if (open) Int.MAX_VALUE else COLLAPSED_LINES
+            }
+        }).apply {
+            setOnLongClickListener {
+                val copied = if (isApproval) m.title else listOf(m.title, m.text).filter { it.isNotBlank() }.joinToString("\n")
+                getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("pushme 消息", copied))
+                Toast.makeText(this@MainActivity, "已复制", Toast.LENGTH_SHORT).show()
+                true
+            }
+        }
     }
 
-    private fun row(vararg buttons: Button) = LinearLayout(this).apply {
-        orientation = LinearLayout.HORIZONTAL
-        for (b in buttons) addView(b, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+    /** 今天的只显示时分，昨天的带「昨天」，更早的带日期。 */
+    private fun timeText(ts: Long): String {
+        if (ts <= 0) return ""
+        val zone = ZoneId.systemDefault()
+        val t = Instant.ofEpochSecond(ts).atZone(zone)
+        val today = LocalDate.now(zone)
+        val hm = t.format(HOUR_MINUTE)
+        return when (val d = t.toLocalDate()) {
+            today -> hm
+            today.minusDays(1) -> "昨天 $hm"
+            else -> if (d.year == today.year) "${d.monthValue}月${d.dayOfMonth}日 $hm" else "${d.year}-${d.monthValue}-${d.dayOfMonth}"
+        }
     }
-
-    private fun section(title: String) = TextView(this).apply {
-        text = title
-        textSize = 16f
-        typeface = Typeface.DEFAULT_BOLD
-        setPadding(0, dp(20), 0, dp(4))
-    }
-
-    private fun note(text: String) = TextView(this).apply {
-        this.text = text
-        textSize = 12f
-        setTextColor(GREY)
-        setPadding(0, dp(4), 0, 0)
-    }
-
-    private fun toast(text: String) = Toast.makeText(this, text, Toast.LENGTH_LONG).show()
 
     companion object {
-        private const val GREY = 0xFF757575.toInt()
-        private const val PENDING_EVERY_MS = 5_000L
+        private const val REFRESH_EVERY_MS = 5_000L
+        // 主页最多显示的消息条数（收件箱只留最近 200 条）
+        private const val HISTORY = 50
+        private const val COLLAPSED_LINES = 5
+        private val HOUR_MINUTE = DateTimeFormatter.ofPattern("HH:mm")
 
-        /** 已经自动弹过的审批（进程内），见 [checkPending]。 */
+        /** 已经自动弹过的审批（进程内），见 [autoOpen]。 */
         private val autoOpened = HashSet<String>()
     }
 }

@@ -14,7 +14,7 @@ import android.os.IBinder
  * 前台服务：长轮询 pushme 的收件箱，来消息就弹通知；遇到待审批，按 `GET /approvals` 的内容弹审批通知，
  * 点开进 [ApprovalActivity]。每次（重新）连上收件箱也查一遍待审批，断线期间来的照样能看到。
  *
- * 谁会启动它：主界面保存配置 / 「启动 / 重连」、开机和 App 升级后的 [BootReceiver]。
+ * 谁会启动它：主页（填过配置时）、设置页「保存并连接」、开机和 App 升级后的 [BootReceiver]。
  */
 class PushService : Service() {
 
@@ -54,7 +54,7 @@ class PushService : Service() {
         // startForegroundService 拉起的必须几秒内 startForeground，先挂上通知
         startForeground(NOTIFICATION_ID, statusNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
         if (!prefs.configured) {
-            setStatus("未配置：在主界面填 pushme 地址和接收方 token")
+            setStatus(Link.OFF, "未配置：在设置里填 pushme 地址和接收方 token")
             return START_STICKY
         }
         val c = prefs.url to prefs.token
@@ -69,13 +69,14 @@ class PushService : Service() {
         generation++
         config = null
         status = "已停止"
+        link = Link.OFF
         super.onDestroy()
     }
 
     private fun startPolling(c: Pair<String, String>) {
         val gen = ++generation
         val client = PushmeClient(c.first, c.second)
-        setStatus("连接中…")
+        setStatus(Link.CONNECTING, "连接中…")
         Thread({
             var backoff = MIN_BACKOFF
             var connected: Boolean? = null
@@ -87,7 +88,7 @@ class PushService : Service() {
                     backoff = MIN_BACKOFF
                     if (connected != true) {
                         connected = true
-                        setStatus("已连上")
+                        setStatus(Link.ONLINE, "已连上")
                         syncApprovals(client) // 断线期间来的审批
                     }
                     if (cursor >= 0) {
@@ -98,7 +99,7 @@ class PushService : Service() {
                 } catch (e: Exception) {
                     if (gen != generation) break
                     connected = false
-                    setStatus("连不上：${PushmeClient.describe(e)}")
+                    setStatus(Link.ERROR, "连不上：${PushmeClient.describe(e)}")
                     try {
                         Thread.sleep(backoff)
                     } catch (_: InterruptedException) {
@@ -147,7 +148,7 @@ class PushService : Service() {
         val pending = try {
             client.pending()
         } catch (e: Exception) {
-            setStatus("已连上（查待审批失败：${PushmeClient.describe(e)}）")
+            setStatus(Link.ONLINE, "已连上（查待审批失败：${PushmeClient.describe(e)}）")
             return
         }
         val offsetMs = if (pending.now > 0) pending.now * 1000 - System.currentTimeMillis() else 0
@@ -185,7 +186,8 @@ class PushService : Service() {
         getSystemService(NotificationManager::class.java).notify(approvalNotificationId(a.id), n)
     }
 
-    private fun setStatus(text: String) {
+    private fun setStatus(state: Link, text: String) {
+        link = state
         status = text
         getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, statusNotification())
     }
@@ -200,6 +202,9 @@ class PushService : Service() {
             .setContentIntent(open)
             .build()
     }
+
+    /** 收件箱连接状态：没在跑、连接中、连上了、连不上（在退避重试）。 */
+    enum class Link { OFF, CONNECTING, ONLINE, ERROR }
 
     companion object {
         private const val CHANNEL_STATUS = "status"
@@ -221,9 +226,13 @@ class PushService : Service() {
         private const val MIN_BACKOFF = 2_000L
         private const val MAX_BACKOFF = 30_000L
 
-        /** 最近一次状态文字，主界面展示用。 */
+        /** 最近一次状态文字和连接状态，界面展示用。 */
         @Volatile
         var status: String = "未启动"
+            private set
+
+        @Volatile
+        var link: Link = Link.OFF
             private set
 
         fun start(context: Context) {

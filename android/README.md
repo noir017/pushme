@@ -3,7 +3,7 @@
 pushme 的手机端：收消息（`GET /inbox`）、审批（`GET /approvals`、`POST /approvals/{id}`）、主动下指令（`POST /commands`）。协议见仓库根目录 [README](../README.md)「审批（手机确认）」。
 
 - 包名 `io.github.noir017.pushme`，Android 11 起（审批密钥要用到「每次签名都验证」）。
-- 不依赖 AndroidX，全部用系统 API；界面在代码里搭。
+- 不依赖 AndroidX，全部用系统 API；界面在代码里搭（配色和控件在 `Ui.kt`，颜色在 `res/values(-night)/colors.xml`，跟随系统深浅色）。
 
 ## 文件
 
@@ -14,14 +14,16 @@ pushme 的手机端：收消息（`GET /inbox`）、审批（`GET /approvals`、
 | `Approver.kt` | 本机密钥（系统密钥库 EC P-256，有安全芯片就放安全芯片）、公钥导出与指纹、**签名内容**（审批、指令分别与 Go 的 `approval.Payload`、`command.Payload` 逐字节一致，改了两边一起改） |
 | `Api.kt` | pushme 接收方客户端 |
 | `GrantActivity.kt` | 主动授权：选在线的 agent（`GET /commands/targets`）、机器、时长，验证后签名投进指令信箱（`POST /commands`），宿主的 `pushme listen` 验签执行；也能一键收回 |
-| `MainActivity.kt` | 填地址和接收方 token、生成密钥、复制 / 分享公钥、权限设置；在前台时有待审批就自动弹出审批页 |
+| `MainActivity.kt` | 主页：连接状态、待审批、主动授权入口、最近 50 条消息（`GET /inbox?after=0`）；在前台时有待审批就自动弹出审批页。待审批的正文只在审批页显示 |
+| `SettingsActivity.kt` | 设置：地址和接收方 token、生成密钥、复制 / 分享公钥、通知 / 耗电 / 自启动 |
+| `Ui.kt` | 配色、页面骨架（顶栏、正文、贴底按钮、系统栏留边）和常用控件；审批类页面的禁截屏、防悬浮窗也在这里统一加 |
 | `BootReceiver.kt` | 开机、升级后拉起服务 |
 
 ## 密钥的规矩
 
 - 每次签名都要当场验证（指纹或锁屏 PIN），且只有手机解锁时才能用。
 - 新录入指纹不作废密钥；删掉锁屏密码会被系统作废，要重新生成、重新配对。
-- 配对：主界面复制公钥，**自己**装到发起审批的机器上，用 `pushme fingerprint <公钥文件>` 打印指纹，和 App 上显示的核对。
+- 配对：设置页复制公钥，**自己**装到发起审批的机器上，用 `pushme fingerprint <公钥文件>` 打印指纹，和 App 上显示的核对。
 
 ## 构建与签名
 
@@ -45,4 +47,4 @@ keytool -genkeypair -keystore pushme-release.jks -storetype PKCS12 -storepass:fi
 ## 本地检查
 
 aarch64 上跑不了 Gradle 的安卓构建（aapt2 只有 x86_64），可以只做类型检查：JDK 17 + kotlinc 2.1 + `android-35/android.jar`，
-外加一个只有 `R.drawable.ic_stat`、`R.string.app_name` 的桩 `R` 对象，`kotlinc -cp android.jar` 编过即可。完整构建交给 CI。
+外加一个桩 `R` 对象（代码里用到的 `R.drawable.*`、`R.string.app_name`、`R.color.*`），`kotlinc -cp android.jar` 编过即可。完整构建交给 CI。
