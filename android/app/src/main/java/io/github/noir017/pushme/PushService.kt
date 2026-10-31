@@ -129,7 +129,15 @@ class PushService : Service() {
     }
 
     private fun messageNotification(caller: String, title: String, text: String, whenMs: Long, alert: Boolean): Notification {
-        val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+        // 点开进消息页，返回回到主页
+        val open = PendingIntent.getActivities(
+            this, 0,
+            arrayOf(
+                Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK),
+                Intent(this, MessagesActivity::class.java),
+            ),
+            PendingIntent.FLAG_IMMUTABLE,
+        )
         return Notification.Builder(this, if (alert) CHANNEL_MESSAGES else CHANNEL_MESSAGES_QUIET)
             .setSmallIcon(R.drawable.ic_stat)
             .setContentTitle(if (title.isEmpty()) "[$caller]" else "[$caller] $title")

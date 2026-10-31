@@ -20,6 +20,10 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import java.time.Instant
+import java.time.LocalDate
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 
 /** 提示条、状态点的语气。 */
 enum class Tone { PLAIN, INFO, GOOD, WARN, BAD }
@@ -31,6 +35,23 @@ enum class Btn { FILLED, TONAL, OUTLINE, TEXT }
 fun View.enable(on: Boolean) {
     isEnabled = on
     alpha = if (on) 1f else 0.4f
+}
+
+private val HOUR_MINUTE = DateTimeFormatter.ofPattern("HH:mm")
+
+/** 时刻（epoch 秒）怎么显示：今天的只显示时分，昨天、明天的带「昨天」「明天」，更远的带日期。 */
+fun timeText(ts: Long): String {
+    if (ts <= 0) return ""
+    val zone = ZoneId.systemDefault()
+    val t = Instant.ofEpochSecond(ts).atZone(zone)
+    val today = LocalDate.now(zone)
+    val hm = t.format(HOUR_MINUTE)
+    return when (val d = t.toLocalDate()) {
+        today -> hm
+        today.minusDays(1) -> "昨天 $hm"
+        today.plusDays(1) -> "明天 $hm"
+        else -> if (d.year == today.year) "${d.monthValue}月${d.dayOfMonth}日 $hm" else "${d.year}-${d.monthValue}-${d.dayOfMonth}"
+    }
 }
 
 private const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT

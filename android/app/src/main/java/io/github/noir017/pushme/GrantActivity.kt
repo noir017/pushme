@@ -2,6 +2,8 @@ package io.github.noir017.pushme
 
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.Context
+import android.content.Intent
 import android.hardware.biometrics.BiometricManager.Authenticators
 import android.hardware.biometrics.BiometricPrompt
 import android.os.Bundle
@@ -108,7 +110,9 @@ class GrantActivity : Activity() {
                 result.onSuccess { t ->
                     offsetMs = if (t.now > 0) t.now * 1000 - System.currentTimeMillis() else 0
                     targets = t.targets
-                    target = t.targets.find { it.name == target?.name } ?: t.targets.singleOrNull()
+                    // 保留已选的；没选过就选主页点进来的那个，只有一个就选它
+                    val want = target?.name ?: intent.getStringExtra(EXTRA_TARGET)
+                    target = t.targets.find { it.name == want } ?: t.targets.singleOrNull()
                     renderTargets(if (t.targets.isEmpty()) "没有在线的 agent：宿主上的 pushme listen 没在跑" else null, retry = true)
                 }.onFailure { renderTargets("取在线名单失败：${PushmeClient.describe(it)}", retry = true) }
                 render()
@@ -243,6 +247,12 @@ class GrantActivity : Activity() {
     private class Host(val name: String, val label: String, val warning: String?)
 
     companion object {
+        private const val EXTRA_TARGET = "target"
+
+        /** 打开主动授权页，预先选好 [target]（调用方名，可空）。 */
+        fun intent(context: Context, target: String?): Intent =
+            Intent(context, GrantActivity::class.java).apply { if (target != null) putExtra(EXTRA_TARGET, target) }
+
         // 指令从签发到过期：宿主 listen 只认 5 分钟以内的，2 分钟足够送到
         private const val LIFE_SECONDS = 120L
         private const val DEFAULT_DURATION = "1h"
@@ -258,6 +268,9 @@ class GrantActivity : Activity() {
             Host("laptop", "laptop", "laptop 上有你的证书，给它等于全部放开"),
             Host("termux-mi14", "mi14", null),
         )
+        /** 机器名的显示名：all 是「全部机器」，termux-mi14 是 mi14。 */
+        fun hostLabel(name: String) = if (name == "all") "全部机器" else HOSTS.find { it.name == name }?.label ?: name
+
         private const val ALL_NOTE = "全部机器：包括 pacvue、edge 设备等不能单选的，等于全部放开"
         private const val OTHERS_NOTE = "别的机器（pacvue、edge 设备等）只能选「全部」。"
     }

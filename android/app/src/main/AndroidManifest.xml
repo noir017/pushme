@@ -30,6 +30,10 @@
             android:name=".SettingsActivity"
             android:exported="false" />
 
+        <activity
+            android:name=".MessagesActivity"
+            android:exported="false" />
+
         <!-- 审批页：不导出（只能由本 App 的通知、主界面打开），不在锁屏上显示（没有 showWhenLocked），
              从锁屏上点通知时系统会先要求解锁 -->
         <activity

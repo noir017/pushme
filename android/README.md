@@ -14,7 +14,8 @@ pushme 的手机端：收消息（`GET /inbox`）、审批（`GET /approvals`、
 | `Approver.kt` | 本机密钥（系统密钥库 EC P-256，有安全芯片就放安全芯片）、公钥导出与指纹、**签名内容**（审批、指令分别与 Go 的 `approval.Payload`、`command.Payload` 逐字节一致，改了两边一起改） |
 | `Api.kt` | pushme 接收方客户端 |
 | `GrantActivity.kt` | 主动授权：选在线的 agent（`GET /commands/targets`）、机器、时长，验证后签名投进指令信箱（`POST /commands`），宿主的 `pushme listen` 验签执行；也能一键收回 |
-| `MainActivity.kt` | 主页：连接状态、待审批、主动授权入口、最近 50 条消息（`GET /inbox?after=0`）；在前台时有待审批就自动弹出审批页。待审批的正文只在审批页显示 |
+| `MainActivity.kt` | 主页：连接状态、待审批、各 agent 当前的授权（宿主 `pushme listen -status-arg _state` 上报，经 `GET /commands/targets` 取），点卡片去主动授权；在前台时有待审批就自动弹出审批页 |
+| `MessagesActivity.kt` | 消息页：最近 50 条消息（`GET /inbox?after=0`，不在手机上另存）；消息通知点开到这里。待审批的正文只在审批页显示 |
 | `SettingsActivity.kt` | 设置：地址和接收方 token、生成密钥、复制 / 分享公钥、通知 / 耗电 / 自启动 |
 | `Ui.kt` | 配色、页面骨架（顶栏、正文、贴底按钮、系统栏留边）和常用控件；审批类页面的禁截屏、防悬浮窗也在这里统一加 |
 | `BootReceiver.kt` | 开机、升级后拉起服务 |

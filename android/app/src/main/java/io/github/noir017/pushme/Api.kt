@@ -34,7 +34,7 @@ class PushmeClient(private val url: String, private val token: String) {
         request("POST", "/approvals/" + URLEncoder.encode(id, "UTF-8"), body.toString(), 15_000)
     }
 
-    /** 最近在线、能下指令的对象（宿主上跑着 pushme listen 的调用方），以及服务器时间。 */
+    /** 最近在线、能下指令的对象（宿主上跑着 pushme listen 的调用方）及其上报的授权状态，以及服务器时间。 */
     fun targets(): CommandTargets = CommandTargets.parse(request("GET", "/commands/targets", null, 15_000))
 
     /** 投递一条签好名的指令（字段与签名内容见 [Approver.commandPayload]）。 */
@@ -142,8 +142,29 @@ data class PendingApprovals(val approvals: List<Approval>, val now: Long) {
     }
 }
 
-/** 能下指令的对象：[name] 是 pushme 调用方名（签进指令的收件方），[label] 是显示名（如 uniagent）。 */
-data class CommandTarget(val name: String, val label: String, val lastSeen: Long)
+/** 能下指令的对象：[name] 是 pushme 调用方名（签进指令的收件方），[label] 是显示名（如 uniagent）；
+ * [status] 是宿主上报的当前授权（旧版 pushme listen 不报，为 null）。 */
+data class CommandTarget(val name: String, val label: String, val lastSeen: Long, val status: GrantStatus?)
+
+/** 一条正在生效的授权：[host] 是机器名（all 为全部机器），[expires] 到期时刻（epoch 秒），[duration] 如 1h，[by] 谁开的。 */
+data class Grant(val host: String, val expires: Long, val duration: String, val by: String)
+
+/**
+ * 宿主上报的授权状态（`agent-grant _state` 经 pushme listen 报上来，pushme 原样转发）：
+ * [broken] 是源证书失效、授权了也用不了的机器；[at] 是上报时刻（epoch 秒）。
+ */
+data class GrantStatus(val grants: List<Grant>, val broken: List<String>, val at: Long) {
+    companion object {
+        fun parse(o: JSONObject, at: Long): GrantStatus {
+            val g = o.optJSONArray("grants")
+            val b = o.optJSONArray("broken")
+            val grants = (0 until (g?.length() ?: 0)).mapNotNull { i ->
+                g!!.optJSONObject(i)?.let { Grant(it.optString("host"), it.optLong("expires"), it.optString("duration"), it.optString("by")) }
+            }
+            return GrantStatus(grants, (0 until (b?.length() ?: 0)).map { b!!.optString(it) }, at)
+        }
+    }
+}
 
 /** `GET /commands/targets`：[now] 是服务器时间（epoch 秒），签发时刻按它校正。 */
 data class CommandTargets(val targets: List<CommandTarget>, val now: Long) {
@@ -152,7 +173,10 @@ data class CommandTargets(val targets: List<CommandTarget>, val now: Long) {
             val arr = o.optJSONArray("targets")
             val list = (0 until (arr?.length() ?: 0)).map { i ->
                 val t = arr!!.getJSONObject(i)
-                CommandTarget(t.getString("name"), t.optString("label").ifEmpty { t.getString("name") }, t.optLong("last_seen"))
+                CommandTarget(
+                    t.getString("name"), t.optString("label").ifEmpty { t.getString("name") }, t.optLong("last_seen"),
+                    t.optJSONObject("status")?.let { GrantStatus.parse(it, t.optLong("status_at")) },
+                )
             }
             return CommandTargets(list, o.optLong("now"))
         }
