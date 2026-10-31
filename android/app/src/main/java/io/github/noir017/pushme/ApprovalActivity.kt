@@ -250,7 +250,7 @@ class ApprovalActivity : Activity() {
                 result.onSuccess {
                     PushService.cancelApproval(this, a.id)
                     Toast.makeText(this, if (sig != null) "已批准" else "已拒绝", Toast.LENGTH_SHORT).show()
-                    finish()
+                    showNextOrFinish()
                 }.onFailure { e ->
                     statusView.text = "提交失败：${PushmeClient.describe(e)}"
                     if (e is ApiError && e.code == 409) {
@@ -258,6 +258,25 @@ class ApprovalActivity : Activity() {
                     } else {
                         setButtons(leftMs(a) > 0)
                     }
+                }
+            }
+        }
+    }
+
+    /** 处理完一条：还有别的待审批就接着显示，没有就关掉。 */
+    private fun showNextOrFinish() {
+        approval = null
+        val client = PushmeClient(prefs.url, prefs.token)
+        io.execute {
+            val next = runCatching { client.pending() }.getOrNull()
+            main.post {
+                if (isFinishing) return@post
+                val a = next?.approvals?.firstOrNull()
+                if (a == null) {
+                    finish()
+                } else {
+                    offsetMs = if (next.now > 0) next.now * 1000 - System.currentTimeMillis() else 0
+                    show(a, "还有一条待审批")
                 }
             }
         }

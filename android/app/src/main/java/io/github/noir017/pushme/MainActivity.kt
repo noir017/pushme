@@ -38,9 +38,14 @@ class MainActivity : Activity() {
     private lateinit var keyView: TextView
     private lateinit var keyButton: Button
 
+    /** 在前台时多久查一次待审批；有新的就自动打开审批页（通知不一定弹得出来，进 App 就能处理）。 */
+    private var lastPendingCheck = 0L
+    private var checkingPending = false
+
     private val tick = object : Runnable {
         override fun run() {
             statusView.text = "状态：${PushService.status}"
+            if (System.currentTimeMillis() - lastPendingCheck >= PENDING_EVERY_MS) checkPending()
             main.postDelayed(this, 1_000)
         }
     }
@@ -104,7 +109,26 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        lastPendingCheck = 0 // 回到前台立刻查一次
         main.post(tick)
+    }
+
+    /** 有还没自动弹过的待审批就打开审批页。同一条只自动弹一次：你退出来不会反复弹，要处理就点「查看待审批」。 */
+    private fun checkPending() {
+        lastPendingCheck = System.currentTimeMillis()
+        if (!prefs.configured || checkingPending) return
+        checkingPending = true
+        val client = PushmeClient(prefs.url, prefs.token)
+        io.execute {
+            val first = runCatching { client.pending().approvals }.getOrNull()?.firstOrNull { it.id !in autoOpened }
+            main.post {
+                checkingPending = false
+                if (first != null && !isFinishing && hasWindowFocus()) {
+                    autoOpened.add(first.id)
+                    startActivity(ApprovalActivity.intent(this, first.id))
+                }
+            }
+        }
     }
 
     override fun onPause() {
@@ -222,5 +246,9 @@ class MainActivity : Activity() {
 
     companion object {
         private const val GREY = 0xFF757575.toInt()
+        private const val PENDING_EVERY_MS = 5_000L
+
+        /** 已经自动弹过的审批（进程内），见 [checkPending]。 */
+        private val autoOpened = HashSet<String>()
     }
 }
