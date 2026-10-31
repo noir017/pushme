@@ -25,20 +25,19 @@ pushme 的手机端：收消息（`GET /inbox`）、审批（`GET /approvals`、
 ## 构建与签名
 
 CI（`.github/workflows/android.yml`）只出**未签名**的包，作为 Actions 产物（`pushme-0.1.<序号>-unsigned`，带 `SHA256SUMS`）。
-签名密钥不进 CI，在你自己的机器上签：
+签名密钥不进 CI，在你自己的机器上用 [`sign.ps1`](sign.ps1) 签（脚本目录里放 `apksigner.jar`、`pushme-release.jks`、`pushme-release.pass`）：
 
-```sh
-# 第一次：生成签名密钥（只做一次，丢了就只能卸载重装、重新配对）
-keytool -genkeypair -keystore pushme-release.jks -alias pushme -keyalg EC -groupname secp256r1 \
-        -validity 36500 -dname "CN=pushme"
+```powershell
+# 第一次：生成签名密钥（只做一次；丢了就只能卸载重装、重新配对）。密码随机生成写进 .pass，不用手输
+keytool -genkeypair -keystore pushme-release.jks -storetype PKCS12 -storepass:file pushme-release.pass `
+        -keypass:file pushme-release.pass -alias pushme -keyalg EC -keysize 256 -sigalg SHA256withECDSA `
+        -validity 36500 -dname "CN=pushme, O=noir017"
 
-# 每次发版：签名、核对
-apksigner sign --ks pushme-release.jks --ks-pass file:pushme-release.pass \
-               --out pushme-0.1.N.apk pushme-0.1.N-unsigned.apk
-apksigner verify --print-certs pushme-0.1.N.apk
+# 每次发版：先核对未签名包的 sha256 与 CI 的 SHA256SUMS 一致，再签
+.\sign.ps1 .\pushme-0.1.N-unsigned.apk     # 输出 pushme-0.1.N.apk，打印证书摘要和包的 sha256
 ```
 
-`apksigner` 在 Android SDK 的 build-tools 里（也可以单独用 `java -jar apksigner.jar`）。签名证书一旦定了就不能换，换了只能卸载重装。
+`apksigner.jar` 取自 Android SDK build-tools（`lib/apksigner.jar`，Java 8 起能跑），不用装整个 SDK。签名证书一旦定了就不能换，换了只能卸载重装。
 
 **App 不自动升级**：每次都是人手动装。没让人改过 App 却冒出一个要装的新版本，别装。
 
