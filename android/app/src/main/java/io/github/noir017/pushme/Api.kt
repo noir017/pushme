@@ -34,6 +34,17 @@ class PushmeClient(private val url: String, private val token: String) {
         request("POST", "/approvals/" + URLEncoder.encode(id, "UTF-8"), body.toString(), 15_000)
     }
 
+    /** 最近在线、能下指令的对象（宿主上跑着 pushme listen 的调用方），以及服务器时间。 */
+    fun targets(): CommandTargets = CommandTargets.parse(request("GET", "/commands/targets", null, 15_000))
+
+    /** 投递一条签好名的指令（字段与签名内容见 [Approver.commandPayload]）。 */
+    fun sendCommand(c: SignedCommand) {
+        val body = JSONObject()
+            .put("to", c.to).put("id", c.id).put("issued", c.issued).put("expires", c.expires)
+            .put("body", c.body).put("sig", c.sig)
+        request("POST", "/commands", body.toString(), 15_000)
+    }
+
     private fun request(method: String, path: String, body: String?, readTimeoutMs: Int): JSONObject {
         val conn = URL(url.trimEnd('/') + path).openConnection() as HttpURLConnection
         try {
@@ -130,3 +141,23 @@ data class PendingApprovals(val approvals: List<Approval>, val now: Long) {
         }
     }
 }
+
+/** 能下指令的对象：[name] 是 pushme 调用方名（签进指令的收件方），[label] 是显示名（如 uniagent）。 */
+data class CommandTarget(val name: String, val label: String, val lastSeen: Long)
+
+/** `GET /commands/targets`：[now] 是服务器时间（epoch 秒），签发时刻按它校正。 */
+data class CommandTargets(val targets: List<CommandTarget>, val now: Long) {
+    companion object {
+        fun parse(o: JSONObject): CommandTargets {
+            val arr = o.optJSONArray("targets")
+            val list = (0 until (arr?.length() ?: 0)).map { i ->
+                val t = arr!!.getJSONObject(i)
+                CommandTarget(t.getString("name"), t.optString("label").ifEmpty { t.getString("name") }, t.optLong("last_seen"))
+            }
+            return CommandTargets(list, o.optLong("now"))
+        }
+    }
+}
+
+/** 一条指令；[sig] 为空表示还没签。 */
+data class SignedCommand(val to: String, val id: String, val issued: Long, val expires: Long, val body: String, val sig: String = "")

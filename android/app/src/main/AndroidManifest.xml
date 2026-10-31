@@ -35,6 +35,13 @@
             android:launchMode="singleTop"
             android:taskAffinity="" />
 
+        <!-- 主动授权：同审批页，不导出、不在锁屏上显示 -->
+        <activity
+            android:name=".GrantActivity"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:taskAffinity="" />
+
         <service
             android:name=".PushService"
             android:exported="false"

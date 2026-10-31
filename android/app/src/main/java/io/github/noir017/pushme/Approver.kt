@@ -87,6 +87,19 @@ object Approver {
         sha256Hex(a.text),
     ).joinToString("\n").toByteArray(Charsets.UTF_8)
 
+    /**
+     * 指令的签名内容，与 pushme 的 command.Payload 逐字节一致（6 行，"\n" 分隔，末尾不带换行）：
+     * pushme-command-v1 / id / to / issued / expires / body。
+     */
+    fun commandPayload(c: SignedCommand): ByteArray = listOf(
+        "pushme-command-v1",
+        c.id,
+        c.to,
+        c.issued.toString(),
+        c.expires.toString(),
+        c.body,
+    ).joinToString("\n").toByteArray(Charsets.UTF_8)
+
     private fun sha256Hex(s: String): String =
         MessageDigest.getInstance("SHA-256").digest(s.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
 }

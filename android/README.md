@@ -1,6 +1,6 @@
 # pushme 手机 App
 
-pushme 的手机端：收消息（`GET /inbox`）、审批（`GET /approvals`、`POST /approvals/{id}`）。协议见仓库根目录 [README](../README.md)「审批（手机确认）」。
+pushme 的手机端：收消息（`GET /inbox`）、审批（`GET /approvals`、`POST /approvals/{id}`）、主动下指令（`POST /commands`）。协议见仓库根目录 [README](../README.md)「审批（手机确认）」。
 
 - 包名 `io.github.noir017.pushme`，Android 11 起（审批密钥要用到「每次签名都验证」）。
 - 不依赖 AndroidX，全部用系统 API；界面在代码里搭。
@@ -11,9 +11,10 @@ pushme 的手机端：收消息（`GET /inbox`）、审批（`GET /approvals`、
 |---|---|
 | `PushService.kt` | 前台服务：长轮询收件箱弹通知；遇到待审批，按 `GET /approvals` 弹审批通知（锁屏上不显示内容） |
 | `ApprovalActivity.kt` | 审批页：显示内容，批准时过系统验证框（指纹或锁屏 PIN）后签名提交；拒绝不签名。禁截屏、被悬浮窗盖住时不接受点击、不在锁屏上显示 |
-| `Approver.kt` | 本机密钥（系统密钥库 EC P-256，有安全芯片就放安全芯片）、公钥导出与指纹、**签名内容**（与 Go 的 `approval.Payload` 逐字节一致，改了两边一起改） |
+| `Approver.kt` | 本机密钥（系统密钥库 EC P-256，有安全芯片就放安全芯片）、公钥导出与指纹、**签名内容**（审批、指令分别与 Go 的 `approval.Payload`、`command.Payload` 逐字节一致，改了两边一起改） |
 | `Api.kt` | pushme 接收方客户端 |
-| `MainActivity.kt` | 填地址和接收方 token、生成密钥、复制 / 分享公钥、权限设置 |
+| `GrantActivity.kt` | 主动授权：选在线的 agent（`GET /commands/targets`）、机器、时长，验证后签名投进指令信箱（`POST /commands`），宿主的 `pushme listen` 验签执行；也能一键收回 |
+| `MainActivity.kt` | 填地址和接收方 token、生成密钥、复制 / 分享公钥、权限设置；在前台时有待审批就自动弹出审批页 |
 | `BootReceiver.kt` | 开机、升级后拉起服务 |
 
 ## 密钥的规矩

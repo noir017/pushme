@@ -25,7 +25,7 @@ import android.widget.Toast
 import java.util.concurrent.Executors
 
 /**
- * 主界面：填 pushme 地址与接收方 token、看连接状态；生成审批密钥、导出公钥配对；待审批入口；常用权限设置。
+ * 主界面：填 pushme 地址与接收方 token、看连接状态；生成审批密钥、导出公钥配对；待审批、主动授权入口；常用权限设置。
  */
 class MainActivity : Activity() {
 
@@ -77,7 +77,10 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(16), dp(16), dp(24))
             addView(statusView)
-            addView(row(button("查看待审批") { startActivity(ApprovalActivity.intent(this@MainActivity, null)) }))
+            addView(row(
+                button("查看待审批") { startActivity(ApprovalActivity.intent(this@MainActivity, null)) },
+                button("主动授权") { startActivity(android.content.Intent(this@MainActivity, GrantActivity::class.java)) },
+            ))
 
             addView(section("连接"))
             addView(urlEdit)
