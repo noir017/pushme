@@ -53,7 +53,7 @@ class MainActivity : Activity() {
         prefs = Prefs(this)
         statusView = TextView(this).apply { textSize = 15f }
         urlEdit = EditText(this).apply {
-            hint = "pushme 地址，如 http://192.168.0.185:8290"
+            hint = "pushme 地址，如 https://pushme.lan.noharanas.eu.org"
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
             setText(prefs.url)
         }
