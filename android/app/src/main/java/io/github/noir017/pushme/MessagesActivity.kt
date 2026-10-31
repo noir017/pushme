@@ -126,8 +126,13 @@ class MessagesActivity : Activity() {
     /** 一条消息：调用方、时间、标题、正文（长的先折起来，点一下展开）；长按复制。待审批的只露标题。 */
     private fun messageCard(m: InboxMessage): View {
         val isApproval = m.approvalId != null
+        val tag = when {
+            isApproval -> " · 审批"
+            m.requestId != null -> " · 申请"
+            else -> ""
+        }
         val views = mutableListOf<View>(ui.row(
-            ui.label(if (isApproval) "${m.caller} · 审批" else m.caller, 13f, if (isApproval) ui.warn else ui.muted, bold = true),
+            ui.label(m.caller + tag, 13f, if (tag.isEmpty()) ui.muted else ui.warn, bold = true),
             ui.label(timeText(m.ts), 12f, ui.muted),
             weights = listOf(1f, 0f),
         ))

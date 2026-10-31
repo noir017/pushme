@@ -15,10 +15,10 @@ import android.widget.TextView
 import java.util.concurrent.Executors
 
 /**
- * 主页：连接状态、待审批（点开去审批）、各 agent 当前的授权（宿主上报的 [GrantStatus]，点卡片去开授权或收回）。
+ * 主页：连接状态、待处理（待审批、agent 的提权申请，点开去处理）、各 agent 当前的授权（上报的 [GrantStatus]，点卡片去开授权或收回）。
  * 消息在 [MessagesActivity]，地址、token、密钥、权限在 [SettingsActivity]。
  *
- * 在前台时每几秒查一次待审批和授权状态；有没自动弹过的待审批就直接打开审批页（通知不一定弹得出来，进 App 就能处理）。
+ * 在前台时每几秒查一次待处理和授权状态；有没自动弹过的就直接打开（通知不一定弹得出来，进 App 就能处理）。
  * 待审批的正文只在审批页（禁截屏）里显示，主页只露标题。
  */
 class MainActivity : Activity() {
@@ -33,6 +33,7 @@ class MainActivity : Activity() {
     private lateinit var grantBox: LinearLayout
 
     private var pending: List<Approval> = emptyList()
+    private var requests: List<GrantRequest> = emptyList()
 
     /** 在线的 agent 及其上报的授权；null 表示还没取到。 */
     private var targets: List<CommandTarget>? = null
@@ -133,8 +134,9 @@ class MainActivity : Activity() {
     private fun refresh() {
         lastRefresh = System.currentTimeMillis()
         if (!prefs.configured) {
-            if (pending.isNotEmpty() || targets != null || targetsError != null) {
+            if (pending.isNotEmpty() || requests.isNotEmpty() || targets != null || targetsError != null) {
                 pending = emptyList()
+                requests = emptyList()
                 targets = null
                 targetsError = null
                 renderPending()
@@ -147,18 +149,20 @@ class MainActivity : Activity() {
         val client = PushmeClient(prefs.url, prefs.token)
         io.execute {
             val p = runCatching { client.pending() }
+            val r = runCatching { client.requests() } // 旧版 pushme 没有（404），当没有申请
             val t = runCatching { client.targets() }
             main.post {
                 refreshing = false
                 if (isDestroyed) return@post
-                p.onSuccess {
-                    offsetMs = if (it.now > 0) it.now * 1000 - System.currentTimeMillis() else 0
-                    if (it.approvals.map { a -> a.id } != pending.map { a -> a.id }) {
-                        pending = it.approvals
-                        renderPending()
-                    }
-                    autoOpen()
+                p.onSuccess { offsetMs = if (it.now > 0) it.now * 1000 - System.currentTimeMillis() else 0 }
+                val newPending = p.getOrNull()?.approvals ?: pending
+                val newRequests = r.getOrNull()?.requests ?: emptyList()
+                if (newPending.map { it.id } != pending.map { it.id } || newRequests.map { it.id } != requests.map { it.id }) {
+                    pending = newPending
+                    requests = newRequests
+                    renderPending()
                 }
+                autoOpen()
                 t.onSuccess {
                     if (it.targets != targets || targetsError != null) {
                         targets = it.targets
@@ -177,17 +181,41 @@ class MainActivity : Activity() {
     }
 
     private fun autoOpen() {
-        val first = pending.firstOrNull { it.id !in autoOpened } ?: return
         if (isFinishing || !hasWindowFocus()) return
-        autoOpened.add(first.id)
-        startActivity(ApprovalActivity.intent(this, first.id))
+        pending.firstOrNull { it.id !in autoOpened }?.let {
+            autoOpened.add(it.id)
+            return startActivity(ApprovalActivity.intent(this, it.id))
+        }
+        requests.firstOrNull { it.id !in autoOpened }?.let {
+            autoOpened.add(it.id)
+            startActivity(GrantActivity.requestIntent(this, it.id))
+        }
     }
 
     private fun renderPending() {
         pendingBox.removeAllViews()
         pendingCountdowns.clear()
-        if (pending.isEmpty()) return
-        ui.add(pendingBox, ui.header("待审批 · ${pending.size}"))
+        if (pending.isEmpty() && requests.isEmpty()) return
+        ui.add(pendingBox, ui.header("待处理 · ${pending.size + requests.size}"))
+        requests.forEachIndexed { i, q ->
+            val left = ui.label(size = 13f, color = ui.warn, bold = true)
+            pendingCountdowns.add(left to {
+                val s = q.expires - serverNow()
+                if (s <= 0) "已过期" else "还剩 %d:%02d".format(s / 60, s % 60)
+            })
+            ui.add(pendingBox, ui.card(
+                ui.row(ui.label("${q.caller} 申请提权", 13f, ui.muted), left, weights = listOf(1f, 0f)),
+                ui.row(ui.label("${q.hosts.split(",").joinToString("、") { GrantActivity.hostLabel(it) }} ${q.duration}", 17f, bold = true),
+                    ui.label("›", 24f, ui.muted), weights = listOf(1f, 0f)),
+                ui.label(q.reason, 14f, ui.muted).apply {
+                    maxLines = 2
+                    ellipsize = android.text.TextUtils.TruncateAt.END
+                },
+                gap = 4,
+                stroke = ui.alpha(ui.warn, 0x99),
+                onClick = { startActivity(GrantActivity.requestIntent(this, q.id)) },
+            ), top = if (i > 0) 8 else 0)
+        }
         pending.forEachIndexed { i, a ->
             val left = ui.label(size = 13f, color = ui.warn, bold = true)
             pendingCountdowns.add(left to {
@@ -200,7 +228,7 @@ class MainActivity : Activity() {
                 gap = 4,
                 stroke = ui.alpha(ui.warn, 0x99),
                 onClick = { startActivity(ApprovalActivity.intent(this, a.id)) },
-            ), top = if (i > 0) 8 else 0)
+            ), top = if (i > 0 || requests.isNotEmpty()) 8 else 0)
         }
         for ((view, text) in pendingCountdowns) view.text = text()
     }

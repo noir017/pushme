@@ -37,6 +37,15 @@ class PushmeClient(private val url: String, private val token: String) {
     /** 最近在线、能下指令的对象（宿主上跑着 pushme listen 的调用方）及其上报的授权状态，以及服务器时间。 */
     fun targets(): CommandTargets = CommandTargets.parse(request("GET", "/commands/targets", null, 15_000))
 
+    /** 还在等处理的 agent 提权申请，以及服务器时间。旧版 pushme 没有这个接口（404）。 */
+    fun requests(): PendingRequests = PendingRequests.parse(request("GET", "/commands/requests", null, 15_000))
+
+    /** 记下对申请的处理（批准只是记账：真正的授权是另签的那条指令）。已处理过或过期抛 [ApiError]（409）。 */
+    fun answerRequest(id: String, approve: Boolean) {
+        val body = JSONObject().put("decision", if (approve) "approve" else "deny")
+        request("POST", "/commands/requests/" + URLEncoder.encode(id, "UTF-8"), body.toString(), 15_000)
+    }
+
     /** 投递一条签好名的指令（字段与签名内容见 [Approver.commandPayload]）。 */
     fun sendCommand(c: SignedCommand) {
         val body = JSONObject()
@@ -85,7 +94,7 @@ class PushmeClient(private val url: String, private val token: String) {
     }
 }
 
-/** 收件箱里的一条消息；[ts] 为受理时刻（epoch 秒），[title] 可能为空；待审批的带 [approvalId]。 */
+/** 收件箱里的一条消息；[ts] 为受理时刻（epoch 秒），[title] 可能为空；待审批的带 [approvalId]，agent 提权申请带 [requestId]。 */
 data class InboxMessage(
     val seq: Long,
     val ts: Long,
@@ -94,6 +103,7 @@ data class InboxMessage(
     val text: String,
     val approvalId: String?,
     val approvalExpires: Long,
+    val requestId: String? = null,
 )
 
 /** `GET /inbox` 的响应：[skipped] 是因条数上限没返回的较早条数，[cursor] 是下次请求的 after。 */
@@ -107,6 +117,7 @@ data class InboxBatch(val messages: List<InboxMessage>, val skipped: Int, val cu
                 InboxMessage(
                     m.getLong("seq"), m.optLong("ts"), m.optString("caller"), m.optString("title"), m.optString("text"),
                     ap?.optString("id")?.ifEmpty { null }, ap?.optLong("expires") ?: 0,
+                    m.optJSONObject("request")?.optString("id")?.ifEmpty { null },
                 )
             }
             return InboxBatch(messages, o.optInt("skipped"), o.getLong("cursor"))
@@ -149,19 +160,55 @@ data class CommandTarget(val name: String, val label: String, val lastSeen: Long
 /** 一条正在生效的授权：[host] 是机器名（all 为全部机器），[expires] 到期时刻（epoch 秒），[duration] 如 1h，[by] 谁开的。 */
 data class Grant(val host: String, val expires: Long, val duration: String, val by: String)
 
+/** 能单台授权的一台机器：[note] 是选它时的提醒（可空）。 */
+data class HostOption(val name: String, val note: String?)
+
 /**
- * 宿主上报的授权状态（`agent-grant _state` 经 pushme listen 报上来，pushme 原样转发）：
- * [broken] 是源证书失效、授权了也用不了的机器；[at] 是上报时刻（epoch 秒）。
+ * 上报的授权状态（宿主的 `agent-grant _state` 或 openwrt 的 `grant-broker _state`，经 pushme listen 报上来，pushme 原样转发）：
+ * [broken] 是源证书失效、授权了也用不了的机器；[hosts] 是能单台授权的机器（grant-broker 才报，旧的宿主不报、为空）；
+ * [at] 是上报时刻（epoch 秒）。
  */
-data class GrantStatus(val grants: List<Grant>, val broken: List<String>, val at: Long) {
+data class GrantStatus(val grants: List<Grant>, val broken: List<String>, val hosts: List<HostOption>, val at: Long) {
     companion object {
         fun parse(o: JSONObject, at: Long): GrantStatus {
             val g = o.optJSONArray("grants")
             val b = o.optJSONArray("broken")
+            val h = o.optJSONArray("hosts")
             val grants = (0 until (g?.length() ?: 0)).mapNotNull { i ->
                 g!!.optJSONObject(i)?.let { Grant(it.optString("host"), it.optLong("expires"), it.optString("duration"), it.optString("by")) }
             }
-            return GrantStatus(grants, (0 until (b?.length() ?: 0)).map { b!!.optString(it) }, at)
+            val hosts = (0 until (h?.length() ?: 0)).mapNotNull { i ->
+                h!!.optJSONObject(i)?.let { x -> x.optString("name").ifEmpty { null }?.let { HostOption(it, x.optString("note").ifEmpty { null }) } }
+            }
+            return GrantStatus(grants, (0 until (b?.length() ?: 0)).map { b!!.optString(it) }, hosts, at)
+        }
+    }
+}
+
+/** agent 的提权申请：[target] 是批准时授权指令发给谁，[hosts] 逗号分隔（all 为全部），[duration] 如 1h。 */
+data class GrantRequest(
+    val id: String,
+    val caller: String,
+    val target: String,
+    val hosts: String,
+    val duration: String,
+    val reason: String,
+    val expires: Long,
+)
+
+/** `GET /commands/requests`：[now] 是服务器时间（epoch 秒）。 */
+data class PendingRequests(val requests: List<GrantRequest>, val now: Long) {
+    companion object {
+        fun parse(o: JSONObject): PendingRequests {
+            val arr = o.optJSONArray("requests")
+            val list = (0 until (arr?.length() ?: 0)).map { i ->
+                val r = arr!!.getJSONObject(i)
+                GrantRequest(
+                    r.getString("id"), r.optString("caller"), r.optString("target"), r.optString("hosts"),
+                    r.optString("duration"), r.optString("reason"), r.optLong("expires"),
+                )
+            }
+            return PendingRequests(list, o.optLong("now"))
         }
     }
 }

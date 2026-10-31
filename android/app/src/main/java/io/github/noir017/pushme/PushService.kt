@@ -89,11 +89,13 @@ class PushService : Service() {
                     if (connected != true) {
                         connected = true
                         setStatus(Link.ONLINE, "已连上")
-                        syncApprovals(client) // 断线期间来的审批
+                        syncApprovals(client) // 断线期间来的审批、申请
+                        syncRequests(client)
                     }
                     if (cursor >= 0) {
                         notifyMessages(batch)
                         if (batch.messages.any { it.approvalId != null }) syncApprovals(client)
+                        if (batch.messages.any { it.requestId != null }) syncRequests(client)
                     }
                     prefs.cursor = batch.cursor
                 } catch (e: Exception) {
@@ -113,10 +115,10 @@ class PushService : Service() {
 
     /**
      * 普通消息一条一个通知；离线后重连一次补收好几条时，只让最新一条提醒，其余静默。
-     * 待审批的消息不在这里弹：内容以 `GET /approvals` 为准（[syncApprovals]）。
+     * 待审批、提权申请不在这里弹：内容以 `GET /approvals`、`GET /commands/requests` 为准（[syncApprovals]、[syncRequests]）。
      */
     private fun notifyMessages(batch: InboxBatch) {
-        val msgs = batch.messages.filter { it.approvalId == null }
+        val msgs = batch.messages.filter { it.approvalId == null && it.requestId == null }
         val nm = getSystemService(NotificationManager::class.java)
         if (batch.skipped > 0) {
             nm.notify(SKIPPED_NOTIFICATION_ID, messageNotification("pushme", "还有 ${batch.skipped} 条较早的消息没显示", "离线太久，完整记录在飞书。", 0, false))
@@ -194,6 +196,39 @@ class PushService : Service() {
         getSystemService(NotificationManager::class.java).notify(approvalNotificationId(a.id), n)
     }
 
+    /** 查一遍 agent 的提权申请，没弹过的弹通知（点开进批申请页）。旧版 pushme 没这个接口，查不到就算了。 */
+    private fun syncRequests(client: PushmeClient) {
+        val pending = runCatching { client.requests() }.getOrNull() ?: return
+        val offsetMs = if (pending.now > 0) pending.now * 1000 - System.currentTimeMillis() else 0
+        for (r in pending.requests) {
+            if (!notified.add("request:" + r.id)) continue
+            val leftMs = r.expires * 1000 - offsetMs - System.currentTimeMillis()
+            if (leftMs <= 0) continue
+            val open = PendingIntent.getActivity(
+                this, r.id.hashCode(), GrantActivity.requestIntent(this, r.id),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+            )
+            val public = Notification.Builder(this, CHANNEL_APPROVALS)
+                .setSmallIcon(R.drawable.ic_stat)
+                .setContentTitle("有一条提权申请")
+                .setContentText("解锁手机后查看")
+                .build()
+            val n = Notification.Builder(this, CHANNEL_APPROVALS)
+                .setSmallIcon(R.drawable.ic_stat)
+                .setContentTitle("${r.caller} 申请提权：${r.hosts} ${r.duration}")
+                .setContentText(r.reason)
+                .setStyle(Notification.BigTextStyle().bigText(r.reason + "\n\n点开处理，${(leftMs + 59_999) / 60_000} 分钟内有效"))
+                .setCategory(Notification.CATEGORY_REMINDER)
+                .setVisibility(Notification.VISIBILITY_PRIVATE)
+                .setPublicVersion(public)
+                .setTimeoutAfter(leftMs)
+                .setAutoCancel(true)
+                .setContentIntent(open)
+                .build()
+            getSystemService(NotificationManager::class.java).notify(requestNotificationId(r.id), n)
+        }
+    }
+
     private fun setStatus(state: Link, text: String) {
         link = state
         status = text
@@ -222,6 +257,7 @@ class PushService : Service() {
         private const val NOTIFICATION_ID = 1
         private const val SKIPPED_NOTIFICATION_ID = 2
         private const val APPROVAL_ID_BASE = 500_000
+        private const val REQUEST_ID_BASE = 600_000
         private const val MESSAGE_ID_BASE = 1_000
         private const val MESSAGE_ID_SPAN = 100_000L
 
@@ -251,6 +287,12 @@ class PushService : Service() {
 
         fun cancelApproval(context: Context, id: String) {
             context.getSystemService(NotificationManager::class.java).cancel(approvalNotificationId(id))
+        }
+
+        fun requestNotificationId(id: String) = REQUEST_ID_BASE + (id.hashCode() and 0xffff)
+
+        fun cancelRequest(context: Context, id: String) {
+            context.getSystemService(NotificationManager::class.java).cancel(requestNotificationId(id))
         }
     }
 }

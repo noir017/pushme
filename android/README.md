@@ -13,7 +13,7 @@ pushme 的手机端：收消息（`GET /inbox`）、审批（`GET /approvals`、
 | `ApprovalActivity.kt` | 审批页：显示内容，批准时过系统验证框（指纹或锁屏 PIN）后签名提交；拒绝不签名。禁截屏、被悬浮窗盖住时不接受点击、不在锁屏上显示 |
 | `Approver.kt` | 本机密钥（系统密钥库 EC P-256，有安全芯片就放安全芯片）、公钥导出与指纹、**签名内容**（审批、指令分别与 Go 的 `approval.Payload`、`command.Payload` 逐字节一致，改了两边一起改） |
 | `Api.kt` | pushme 接收方客户端 |
-| `GrantActivity.kt` | 主动授权：选在线的 agent（`GET /commands/targets`）、机器、时长，验证后签名投进指令信箱（`POST /commands`），宿主的 `pushme listen` 验签执行；也能一键收回 |
+| `GrantActivity.kt` | 主动授权：选在线的 agent（`GET /commands/targets`）、机器（对象上报了就用它报的清单）、时长，验证后签名投进指令信箱（`POST /commands`），那边的 `pushme listen` 验签执行；也能一键收回。也是批 agent 提权申请的页面（`GET/POST /commands/requests`）：按申请预先选好，批准 = 照选好的签一条授权指令 |
 | `MainActivity.kt` | 主页：连接状态、待审批、各 agent 当前的授权（宿主 `pushme listen -status-arg _state` 上报，经 `GET /commands/targets` 取），点卡片去主动授权；在前台时有待审批就自动弹出审批页 |
 | `MessagesActivity.kt` | 消息页：最近 50 条消息（`GET /inbox?after=0`，不在手机上另存）；消息通知点开到这里。待审批的正文只在审批页显示 |
 | `SettingsActivity.kt` | 设置：地址和接收方 token、生成密钥、复制 / 分享公钥、通知 / 耗电 / 自启动 |
