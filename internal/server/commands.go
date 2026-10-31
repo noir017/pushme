@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"io"
@@ -101,6 +102,36 @@ func (s *Server) getCommands(w http.ResponseWriter, r *http.Request) {
 		s.log().Info("commands delivered", "to", caller, "count", len(cmds), "cursor", cursor)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "commands": cmds, "cursor": cursor})
+}
+
+// commandStatus：POST /commands/status（调用方），body 是一个 JSON 对象（≤4KB），作为本调用方的当前状态挂在在线名单上，
+// App 从 GET /commands/targets 读。pushme 不解析内容，原样转发；只放内存，重启就丢（listen 会定时重报）。
+func (s *Server) commandStatus(w http.ResponseWriter, r *http.Request) {
+	if s.commandsDisabled(w) {
+		return
+	}
+	caller := s.callerOf(r)
+	if caller == "" {
+		unauthorized(w)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, command.MaxStatus+1))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "read body: " + err.Error()})
+		return
+	}
+	if len(body) > command.MaxStatus {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "status must be at most " + strconv.Itoa(command.MaxStatus) + " bytes"})
+		return
+	}
+	var obj map[string]json.RawMessage
+	var compact bytes.Buffer
+	if json.Unmarshal(body, &obj) != nil || obj == nil || json.Compact(&compact, body) != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "status must be a JSON object"})
+		return
+	}
+	s.Commands.Report(caller, compact.Bytes())
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 // commandTargets：GET /commands/targets（接收方），最近在线、能下指令的调用方，带服务器时间供手机校正。

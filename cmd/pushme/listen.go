@@ -26,26 +26,35 @@ import (
 //
 //	PUSHME_URL=http://192.168.0.185:8290 PUSHME_TOKEN=<调用方 token> \
 //	  pushme listen -to agent-grant -label uniagent -pubkey /etc/agent-grant/approver.pub \
-//	                -exec /usr/local/sbin/agent-grant -exec-arg _cmd
+//	                -exec /usr/local/sbin/agent-grant -exec-arg _cmd -status-arg _state
 //
 // 指令正文按空白切开，接在 -exec（和 -exec-arg）后面当参数执行（不经 shell），环境变量另带 PUSHME_CMD_ID / PUSHME_CMD_BY。
 // 只执行：收件方是 -to、签名对得上、没过期（签发时刻不晚于现在 1 分钟、有效期不超过 5 分钟）、同一个 id 没执行过的。
 // 验不过的不执行，经 /send 推一条警告。一直跑到 SIGINT/SIGTERM；连不上 pushme 就退避重试，token 不对（4xx）直接退出。
+//
+// 给了 -status-arg 时，每 30 秒和每执行完一条指令，跑一次 -exec 加这些参数（不带 -exec-arg），
+// 输出（一个 JSON 对象，如当前授权）经 POST /commands/status 报给 pushme，App 首页显示。
 
 type listenConfig struct {
 	URL, Token, To, Label string
 	Pub                   *ecdsa.PublicKey
 	Exec                  string
 	ExecArgs              []string
-	Client                *http.Client
-	Log                   io.Writer
-	Now                   func() time.Time
-	Backoff               []time.Duration
+	// StatusArgs 非空时定时跑 Exec StatusArgs…，把输出当状态上报，见 reportStatus。
+	StatusArgs  []string
+	StatusEvery time.Duration
+	Client      *http.Client
+	Log         io.Writer
+	Now         func() time.Time
+	Backoff     []time.Duration
 	// Run 执行一条验过的指令，返回合并的输出；默认 exec.CommandContext，2 分钟超时。
 	Run func(ctx context.Context, name string, args, env []string) (string, error)
 }
 
-const listenPollWait = 50
+const (
+	listenPollWait = 50
+	statusEvery    = 30 * time.Second
+)
 
 type multiFlag []string
 
@@ -62,6 +71,8 @@ func listenMain(args []string, getenv func(string) string, stdout, stderr io.Wri
 	execPath := fs.String("exec", "", "验过的指令交给它执行，必填")
 	var execArgs multiFlag
 	fs.Var(&execArgs, "exec-arg", "放在指令正文前面的固定参数（可重复）")
+	var statusArgs multiFlag
+	fs.Var(&statusArgs, "status-arg", "查当前状态时接在 -exec 后面的参数（可重复；给了才上报，输出要是一个 JSON 对象）")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -84,7 +95,7 @@ func listenMain(args []string, getenv func(string) string, stdout, stderr io.Wri
 	defer stop()
 	err = runListen(ctx, listenConfig{
 		URL: strings.TrimRight(*base, "/"), Token: token, To: *to, Label: *label,
-		Pub: pub, Exec: *execPath, ExecArgs: execArgs, Log: stdout,
+		Pub: pub, Exec: *execPath, ExecArgs: execArgs, StatusArgs: statusArgs, Log: stdout,
 	})
 	if err != nil {
 		fmt.Fprintln(stderr, "pushme listen:", err)
@@ -112,10 +123,18 @@ func runListen(ctx context.Context, cfg listenConfig) error {
 	if cfg.Run == nil {
 		cfg.Run = runCommand
 	}
+	if cfg.StatusEvery <= 0 {
+		cfg.StatusEvery = statusEvery
+	}
 	logf := func(format string, a ...any) {
 		fmt.Fprintf(cfg.Log, "%s %s\n", time.Now().Format("2006-01-02 15:04:05"), fmt.Sprintf(format, a...))
 	}
 	logf("listen 启动：收件方 %s（%s），执行 %s %s", cfg.To, cfg.Label, cfg.Exec, strings.Join(cfg.ExecArgs, " "))
+	// 执行完指令就催一次状态上报，App 上马上看得到
+	kick := make(chan struct{}, 1)
+	if len(cfg.StatusArgs) > 0 {
+		go reportStatus(ctx, cfg, kick, logf)
+	}
 
 	cursor := int64(-1)
 	seen := map[string]int64{} // 执行过的指令 id → 过期时刻，过期后删掉
@@ -155,6 +174,12 @@ func runListen(ctx context.Context, cfg listenConfig) error {
 		failures = 0
 		for _, c := range got.Commands {
 			handleCommand(ctx, cfg, c, seen, logf)
+		}
+		if len(got.Commands) > 0 {
+			select {
+			case kick <- struct{}{}:
+			default:
+			}
 		}
 		cursor = got.Cursor
 	}
@@ -204,6 +229,40 @@ func handleCommand(ctx context.Context, cfg listenConfig, c command.Command, see
 		return
 	}
 	logf("指令 id=%s 完成：%s", c.ID, strings.TrimSpace(out))
+}
+
+// reportStatus 每 StatusEvery（或被 kick 催）跑一次状态命令，把输出报给 pushme。
+// 出错只在「好 → 坏」时记一行日志，免得 pushme 没升级或断网时每 30 秒刷一次屏。
+func reportStatus(ctx context.Context, cfg listenConfig, kick <-chan struct{}, logf func(string, ...any)) {
+	t := time.NewTicker(cfg.StatusEvery)
+	defer t.Stop()
+	failing := false
+	for {
+		out, err := cfg.Run(ctx, cfg.Exec, cfg.StatusArgs, nil)
+		status := []byte(strings.TrimSpace(out))
+		switch {
+		case ctx.Err() != nil:
+			return
+		case err != nil:
+			err = fmt.Errorf("状态命令出错：%w（%s）", err, status)
+		case !json.Valid(status) || len(status) == 0 || status[0] != '{':
+			err = fmt.Errorf("状态命令的输出不是 JSON 对象：%.200s", status)
+		default:
+			err = apiCall(ctx, cfg.Client, cfg.URL, cfg.Token, "POST", "/commands/status", status, &struct{}{})
+		}
+		if err != nil && !failing && ctx.Err() == nil {
+			logf("上报状态失败：%v", err)
+		} else if err == nil && failing {
+			logf("上报状态恢复")
+		}
+		failing = err != nil
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		case <-kick:
+		}
+	}
 }
 
 func runCommand(ctx context.Context, name string, args, env []string) (string, error) {

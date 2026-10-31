@@ -7,6 +7,7 @@ package command
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sort"
 	"strconv"
@@ -23,6 +24,8 @@ const (
 	MaxLife = 5 * time.Minute
 	// MaxBody 是指令正文上限（一行，如 "grant unraid,openwrt 1h"）。
 	MaxBody = 200
+	// MaxStatus 是 listen 上报的状态上限（字节）。
+	MaxStatus = 4096
 )
 
 var ErrInvalid = errors.New("invalid command")
@@ -67,10 +70,13 @@ func Check(c Command, now time.Time) error {
 }
 
 // Listener 是最近来取过指令的调用方，App 据此列出能下指令的对象。
+// Status 是它最近一次上报的状态（一个 JSON 对象，如当前授权），pushme 不解析、原样转给 App；StatusAt 是上报时刻。
 type Listener struct {
-	Name     string `json:"name"`
-	Label    string `json:"label"`
-	LastSeen int64  `json:"last_seen"`
+	Name     string          `json:"name"`
+	Label    string          `json:"label"`
+	LastSeen int64           `json:"last_seen"`
+	Status   json.RawMessage `json:"status,omitempty"`
+	StatusAt int64           `json:"status_at,omitempty"`
 }
 
 type Box struct {
@@ -169,7 +175,28 @@ func (b *Box) Seen(name, label string) {
 	if label == "" {
 		label = name
 	}
-	b.listeners[name] = &Listener{Name: name, Label: label, LastSeen: b.now().Unix()}
+	l := b.listener(name)
+	l.Label, l.LastSeen = label, b.now().Unix()
+}
+
+// Report 记下某个调用方上报的状态（调用方先确认过是 JSON 对象），也算它来过。
+func (b *Box) Report(name string, status json.RawMessage) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	l := b.listener(name)
+	l.Status = append(json.RawMessage(nil), status...)
+	l.StatusAt = b.now().Unix()
+	l.LastSeen = l.StatusAt
+}
+
+// listener 取（没有就建）某个调用方的记录；调用方持有 b.mu。
+func (b *Box) listener(name string) *Listener {
+	l := b.listeners[name]
+	if l == nil {
+		l = &Listener{Name: name, Label: name}
+		b.listeners[name] = l
+	}
+	return l
 }
 
 // Listeners 返回 within 内来取过指令的调用方，按名字排序。

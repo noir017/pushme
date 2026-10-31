@@ -111,7 +111,8 @@ token 只从环境变量读（不出现在进程参数里）。等待中连不�
 |---|---|---|
 | `POST /commands` | 接收方 | `{"to":"<调用方名>","id","issued","expires","body","sig"}`。`body` 一行 ≤200 字节；`expires - issued` ≤5 分钟；`to` 必须是已有调用方 |
 | `GET /commands?after=&wait=&label=` | 调用方 | 取发给自己的指令（长轮询，≤60 秒）；不带 `after` 只返回当前 `cursor`。顺带登记自己在线，`label` 是在 App 上显示的名字 |
-| `GET /commands/targets` | 接收方 | 3 分钟内来取过指令的调用方 `{"targets":[{"name","label","last_seen"}],"now"}`，App 据此列出能下指令的对象 |
+| `GET /commands/targets` | 接收方 | 3 分钟内来取过指令的调用方 `{"targets":[{"name","label","last_seen","status","status_at"}],"now"}`，App 据此列出能下指令的对象、显示它们上报的状态 |
+| `POST /commands/status` | 调用方 | body 是一个 JSON 对象（≤4KB），作为本调用方的当前状态挂到在线名单上（`status`）。pushme 不解析，原样转给 App；只放内存 |
 
 指令只放内存，几分钟就过期，pushme 重启就丢。签名内容（6 行，`\n` 分隔，末尾不带换行）：
 
@@ -128,8 +129,12 @@ pushme-command-v1
 
 ```sh
 PUSHME_URL=http://<host>:8290 PUSHME_TOKEN=<调用方 token> \
-  pushme listen -to <本调用方名> -label <显示名> -pubkey /path/approver.pub -exec /usr/local/sbin/agent-grant -exec-arg _cmd
+  pushme listen -to <本调用方名> -label <显示名> -pubkey /path/approver.pub -exec /usr/local/sbin/agent-grant -exec-arg _cmd [-status-arg _state]
 ```
+
+加 `-status-arg _state` 时，每 30 秒和每执行完一条指令跑一次 `-exec _state`，把输出（一个 JSON 对象）经 `POST /commands/status` 报上去。
+App 认的格式（`agent-grant _state` 输出的）：`{"grants":[{"host":"unraid","expires":<epoch 秒>,"duration":"1h","by":"…"}],"broken":["…"]}`，
+`host` 为 `all` 表示全部机器，`broken` 是源证书失效、授权了也用不了的机器。
 
 只执行收件方是 `-to`、签名对得上、没过期（签发不晚于现在 1 分钟、有效期 ≤5 分钟）、同一个 `id` 没执行过的指令；
 正文按空白切开接在 `-exec` / `-exec-arg` 后面执行（不经 shell），环境变量带 `PUSHME_CMD_ID`、`PUSHME_CMD_BY`。

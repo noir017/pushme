@@ -98,3 +98,20 @@ func TestListeners(t *testing.T) {
 		t.Fatalf("太久没来的不算在线：%+v", l)
 	}
 }
+
+func TestListenerStatus(t *testing.T) {
+	c := &clock{time.Unix(1_700_000_000, 0)}
+	b := New(c.now)
+	b.Report("agent-grant", []byte(`{"grants":[]}`)) // 还没来取过指令就先报了状态
+	b.Seen("agent-grant", "uniagent")
+	c.t = c.t.Add(time.Minute)
+	b.Report("agent-grant", []byte(`{"grants":[{"host":"unraid"}]}`))
+	l := b.Listeners(3 * time.Minute)
+	if len(l) != 1 || l[0].Label != "uniagent" || string(l[0].Status) != `{"grants":[{"host":"unraid"}]}` || l[0].StatusAt != c.t.Unix() || l[0].LastSeen != c.t.Unix() {
+		t.Fatalf("上报状态不该冲掉显示名，再来取指令也不该冲掉状态：%+v", l)
+	}
+	b.Seen("agent-grant", "uniagent")
+	if l := b.Listeners(3 * time.Minute); string(l[0].Status) == "" {
+		t.Fatalf("Seen 冲掉了状态：%+v", l)
+	}
+}

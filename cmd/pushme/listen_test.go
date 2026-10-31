@@ -158,6 +158,54 @@ func TestListenExecutesSignedCommands(t *testing.T) {
 	}
 }
 
+// statusRuns 模拟带状态的 agent-grant：_cmd 改状态，_state 输出当前状态。
+type statusRuns struct {
+	runs
+	state string
+}
+
+func (r *statusRuns) run(ctx context.Context, name string, args, env []string) (string, error) {
+	if len(args) > 0 && args[0] == "_state" {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		return r.state + "\n", nil
+	}
+	r.mu.Lock()
+	r.state = `{"grants":[{"host":"unraid"}]}`
+	r.mu.Unlock()
+	return r.runs.run(ctx, name, args, env)
+}
+
+func TestListenReportsStatus(t *testing.T) {
+	key := genKey(t)
+	ts, _ := newCommandPushme(t)
+	r := &statusRuns{state: `{"grants":[]}`}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		// 定时上报设得很长：执行完指令后的那次上报只能是被催出来的
+		_ = runListen(ctx, listenConfig{URL: ts.URL, Token: listenTok, To: "agent-grant", Label: "uniagent",
+			Pub: &key.PublicKey, Exec: "/usr/local/sbin/agent-grant", ExecArgs: []string{"_cmd"},
+			StatusArgs: []string{"_state"}, StatusEvery: time.Hour, Run: r.run})
+	}()
+	targets := func() string {
+		req, _ := http.NewRequest("GET", ts.URL+"/commands/targets", nil)
+		req.Header.Set("Authorization", "Bearer "+askPhoneTok)
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return ""
+		}
+		defer res.Body.Close()
+		b, _ := io.ReadAll(res.Body)
+		return string(b)
+	}
+	waitFor(t, "启动时上报", func() bool { return strings.Contains(targets(), `"status":{"grants":[]}`) })
+	waitFor(t, "listen 上线", func() bool { return strings.Contains(targets(), `"label":"uniagent"`) })
+	now := time.Now().Unix()
+	sendCommand(t, ts.URL, key, command.Command{To: "agent-grant", Issued: now, Expires: now + 120, Body: "grant unraid 1h"})
+	waitFor(t, "执行完指令马上重报", func() bool { return strings.Contains(targets(), `"status":{"grants":[{"host":"unraid"}]}`) })
+}
+
 func TestListenRejectsMisaddressedAndExpired(t *testing.T) {
 	key := genKey(t)
 	r := &runs{}

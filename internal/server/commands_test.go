@@ -122,3 +122,28 @@ func TestCommandAuthAndValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestCommandStatus(t *testing.T) {
+	h := newCommandServer(t)
+	for _, c := range []struct{ body, want string }{
+		{`[1,2]`, "JSON object"},
+		{`null`, "JSON object"},
+		{`{"grants":`, "JSON object"},
+		{`{"x":"` + strings.Repeat("a", command.MaxStatus) + `"}`, "at most"},
+	} {
+		if rec, out := do(t, h, "POST", "/commands/status", "application/json", callerTok, c.body); rec.Code != 400 || !strings.Contains(out, c.want) {
+			t.Errorf("%.20s：应 400 %s，实际 %d %s", c.body, c.want, rec.Code, out)
+		}
+	}
+	if rec, _ := do(t, h, "POST", "/commands/status", "application/json", recvTok, `{}`); rec.Code != 401 {
+		t.Fatalf("接收方不能报状态，实际 %d", rec.Code)
+	}
+	getCmds(t, h, callerTok, "?label=uniagent")
+	if rec, out := do(t, h, "POST", "/commands/status", "application/json", callerTok, "{\n  \"grants\": [{\"host\": \"unraid\", \"expires\": 1793430000}]\n}"); rec.Code != 200 {
+		t.Fatalf("%d %s", rec.Code, out)
+	}
+	_, out := do(t, h, "GET", "/commands/targets", "", recvTok, "")
+	if !strings.Contains(out, `"label":"uniagent"`) || !strings.Contains(out, `"status":{"grants":[{"host":"unraid","expires":1793430000}]}`) || !strings.Contains(out, `"status_at":`) {
+		t.Fatalf("在线名单应带上报的状态（压成一行）：%s", out)
+	}
+}

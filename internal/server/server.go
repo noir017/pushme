@@ -84,6 +84,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /commands", s.postCommand)
 	mux.HandleFunc("GET /commands", s.getCommands)
 	mux.HandleFunc("GET /commands/targets", s.commandTargets)
+	mux.HandleFunc("POST /commands/status", s.commandStatus)
 	return mux
 }
 
