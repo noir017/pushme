@@ -147,3 +147,67 @@ func TestCommandStatus(t *testing.T) {
 		t.Fatalf("在线名单应带上报的状态（压成一行）：%s", out)
 	}
 }
+
+func TestGrantRequestFlow(t *testing.T) {
+	h := newCommandServer(t)
+	body := func(target, hosts string) string {
+		b, _ := json.Marshal(map[string]string{"target": target, "hosts": hosts, "duration": "1h", "reason": "重启 newapi，要改配置"})
+		return string(b)
+	}
+	if rec, _ := do(t, h, "POST", "/commands/requests", "application/json", recvTok, body("acme", "unraid")); rec.Code != 401 {
+		t.Fatalf("接收方不能提申请：%d", rec.Code)
+	}
+	if rec, out := do(t, h, "POST", "/commands/requests", "application/json", callerTok, body("acme", "unraid;reboot")); rec.Code != 400 {
+		t.Fatalf("机器名不合法应 400：%d %s", rec.Code, out)
+	}
+	if rec, _ := do(t, h, "POST", "/commands/requests", "application/json", callerTok, body("nobody", "unraid")); rec.Code != 404 {
+		t.Fatalf("target 不是调用方应 404：%d", rec.Code)
+	}
+	rec, out := do(t, h, "POST", "/commands/requests", "application/json", callerTok, body("acme", "unraid"))
+	if rec.Code != 200 {
+		t.Fatalf("%d %s", rec.Code, out)
+	}
+	var created struct{ ID string }
+	_ = json.Unmarshal([]byte(out), &created)
+
+	// App 看得到，收件箱里有带 request 的提醒
+	_, out = do(t, h, "GET", "/commands/requests", "", recvTok, "")
+	if !strings.Contains(out, `"id":"`+created.ID+`"`) || !strings.Contains(out, `"caller":"openwrt"`) || !strings.Contains(out, `"target":"acme"`) || !strings.Contains(out, `"now":`) {
+		t.Fatalf("待处理列表：%s", out)
+	}
+	_, out = do(t, h, "GET", "/inbox?after=0", "", recvTok, "")
+	if !strings.Contains(out, `"request":{"id":"`+created.ID+`"`) || !strings.Contains(out, "openwrt 申请提权：unraid 1h") {
+		t.Fatalf("收件箱：%s", out)
+	}
+
+	// 发申请的调用方长轮询结果；App 批准后立即返回
+	done := make(chan string)
+	go func() {
+		_, out := do(t, h, "GET", "/commands/requests/"+created.ID+"?wait=10", "", callerTok, "")
+		done <- out
+	}()
+	time.Sleep(50 * time.Millisecond)
+	if rec, out := do(t, h, "POST", "/commands/requests/"+created.ID, "application/json", recvTok, `{"decision":"maybe"}`); rec.Code != 400 {
+		t.Fatalf("%d %s", rec.Code, out)
+	}
+	if rec, out := do(t, h, "POST", "/commands/requests/"+created.ID, "application/json", recvTok, `{"decision":"approve"}`); rec.Code != 200 {
+		t.Fatalf("%d %s", rec.Code, out)
+	}
+	select {
+	case out := <-done:
+		if !strings.Contains(out, `"state":"approved"`) {
+			t.Fatalf("%s", out)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("批准后长轮询应立即返回")
+	}
+	if rec, _ := do(t, h, "POST", "/commands/requests/"+created.ID, "application/json", recvTok, `{"decision":"deny"}`); rec.Code != 409 {
+		t.Fatalf("只认第一次，实际 %d", rec.Code)
+	}
+	if rec, _ := do(t, h, "GET", "/commands/requests/"+created.ID, "", "Bearer tok-acme-0123456789", ""); rec.Code != 404 {
+		t.Fatalf("别的调用方取不到，实际 %d", rec.Code)
+	}
+	if _, out := do(t, h, "GET", "/commands/requests", "", recvTok, ""); strings.Contains(out, created.ID) {
+		t.Fatalf("处理过的不再列出：%s", out)
+	}
+}

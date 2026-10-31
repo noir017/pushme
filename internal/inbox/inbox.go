@@ -26,6 +26,9 @@ type Message struct {
 	// Approval 非空表示这是一条待审批（POST /approvals 发起的）：App 据此打开审批页，
 	// 要签名的内容以 GET /approvals 返回的为准。不认识这个字段的 App 当普通消息显示。
 	Approval *ApprovalRef `json:"approval,omitempty"`
+	// Request 非空表示这是一条 agent 的提权申请（POST /commands/requests）：App 据此打开申请页，
+	// 内容以 GET /commands/requests 返回的为准。
+	Request *ApprovalRef `json:"request,omitempty"`
 }
 
 type ApprovalRef struct {
@@ -77,18 +80,23 @@ func (b *Inbox) Latest() int64 {
 
 // Add 存一条并唤醒在等的长轮询。落盘失败也照样留在内存里（App 照样收得到），错误交给调用方记日志。
 func (b *Inbox) Add(caller, title, text string) (Message, error) {
-	return b.add(caller, title, text, nil)
+	return b.add(Message{Caller: caller, Title: title, Text: text})
 }
 
 // AddApproval 同 Add，消息带上审批的引用。
 func (b *Inbox) AddApproval(caller, title, text string, ref ApprovalRef) (Message, error) {
-	return b.add(caller, title, text, &ref)
+	return b.add(Message{Caller: caller, Title: title, Text: text, Approval: &ref})
 }
 
-func (b *Inbox) add(caller, title, text string, ref *ApprovalRef) (Message, error) {
+// AddRequest 存一条提权申请的提醒（ref 指向 GET /commands/requests 里的那条）。
+func (b *Inbox) AddRequest(caller, title, text string, ref ApprovalRef) (Message, error) {
+	return b.add(Message{Caller: caller, Title: title, Text: text, Request: &ref})
+}
+
+func (b *Inbox) add(m Message) (Message, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	m := Message{Seq: b.latestLocked() + 1, TS: b.now().Unix(), Caller: caller, Title: title, Text: text, Approval: ref}
+	m.Seq, m.TS = b.latestLocked()+1, b.now().Unix()
 	b.msgs = append(b.msgs, m)
 	if n := len(b.msgs) - Keep; n > 0 {
 		b.msgs = append([]Message(nil), b.msgs[n:]...)

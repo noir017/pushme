@@ -85,6 +85,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /commands", s.getCommands)
 	mux.HandleFunc("GET /commands/targets", s.commandTargets)
 	mux.HandleFunc("POST /commands/status", s.commandStatus)
+	mux.HandleFunc("POST /commands/requests", s.createRequest)
+	mux.HandleFunc("GET /commands/requests", s.pendingRequests)
+	mux.HandleFunc("POST /commands/requests/{id}", s.answerRequest)
+	mux.HandleFunc("GET /commands/requests/{id}", s.requestResult)
 	return mux
 }
 

@@ -113,6 +113,10 @@ token 只从环境变量读（不出现在进程参数里）。等待中连不�
 | `GET /commands?after=&wait=&label=` | 调用方 | 取发给自己的指令（长轮询，≤60 秒）；不带 `after` 只返回当前 `cursor`。顺带登记自己在线，`label` 是在 App 上显示的名字 |
 | `GET /commands/targets` | 接收方 | 3 分钟内来取过指令的调用方 `{"targets":[{"name","label","last_seen","status","status_at"}],"now"}`，App 据此列出能下指令的对象、显示它们上报的状态 |
 | `POST /commands/status` | 调用方 | body 是一个 JSON 对象（≤4KB），作为本调用方的当前状态挂到在线名单上（`status`）。pushme 不解析，原样转给 App；只放内存 |
+| `POST /commands/requests` | 调用方 | agent 申请提权：`{"target","hosts","duration","reason"}` → `{"id","expires"}`。`target` 是批准时授权指令发给谁（某个 listen 的调用方名）；5 分钟有效，每个调用方同时最多挂 3 条；收件箱里放一条带 `request: {"id","expires"}` 的提醒，飞书也提醒一句 |
+| `GET /commands/requests` | 接收方 | 还在等处理的申请 `{"requests":[{"id","caller","target","hosts","duration","reason","created","expires","state"}],"now"}` |
+| `POST /commands/requests/{id}` | 接收方 | `{"decision":"approve"｜"deny"}`，只认第一次（之后或过期 409）。批准只是记账：真正的授权是 App 另签、发给 `target` 的那条指令，pushme 伪造不了 |
+| `GET /commands/requests/{id}?wait=秒` | 发申请的调用方 | `{"state":"pending｜approved｜denied｜expired"}`，pending 时最多挂 `wait` 秒（≤60）；别的调用方取不到（404）。只放内存，pushme 重启就丢 |
 
 指令只放内存，几分钟就过期，pushme 重启就丢。签名内容（6 行，`\n` 分隔，末尾不带换行）：
 

@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
 	"time"
 
 	"github.com/noir017/pushme/internal/command"
+	"github.com/noir017/pushme/internal/inbox"
 )
 
 // 指令信箱：手机（接收方）给某个调用方投签好名的指令，调用方（宿主上的 pushme listen）长轮询取走、自己验签执行。
@@ -144,4 +146,125 @@ func (s *Server) commandTargets(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "targets": s.Commands.Listeners(listenerFresh), "now": time.Now().Unix()})
+}
+
+// ---- 提权申请：agent 提、App 批（批准 = App 另签一条授权指令发给 target，pushme 只记结果）----
+
+// createRequest：POST /commands/requests（调用方），body {"target","hosts","duration","reason"}，返回 {"id","expires"}。
+func (s *Server) createRequest(w http.ResponseWriter, r *http.Request) {
+	if s.commandsDisabled(w) {
+		return
+	}
+	caller := s.callerOf(r)
+	if caller == "" {
+		unauthorized(w)
+		return
+	}
+	var in command.Request
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxBody)).Decode(&in); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid JSON: " + err.Error()})
+		return
+	}
+	req := command.Request{Caller: caller, Target: in.Target, Hosts: in.Hosts, Duration: in.Duration, Reason: in.Reason}
+	if err := command.CheckRequest(req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	if !s.isCaller(req.Target) {
+		writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "error": "no such caller: " + req.Target})
+		return
+	}
+	lg := s.log().With("caller", caller)
+	if !s.allow(caller) {
+		lg.Warn("rate limited")
+		writeJSON(w, http.StatusTooManyRequests, map[string]any{"ok": false, "error": "rate limited"})
+		return
+	}
+	req, err := s.Commands.AddRequest(req)
+	if err != nil {
+		writeJSON(w, http.StatusTooManyRequests, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	title := caller + " 申请提权：" + req.Hosts + " " + req.Duration
+	if s.Inbox != nil {
+		if _, err := s.Inbox.AddRequest(caller, title, req.Reason, inbox.ApprovalRef{ID: req.ID, Expires: req.Expires}); err != nil {
+			lg.Error("inbox save failed", "err", err)
+		}
+	}
+	go s.sendDetached(caller, format(caller, title, "理由："+req.Reason+"\n\n请在手机 pushme App 上处理，5 分钟内有效。"))
+	lg.Info("grant request created", "id", req.ID, "target", req.Target, "hosts", req.Hosts, "duration", req.Duration)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": req.ID, "expires": req.Expires})
+}
+
+// pendingRequests：GET /commands/requests（接收方），还在等处理的申请，带服务器时间。
+func (s *Server) pendingRequests(w http.ResponseWriter, r *http.Request) {
+	if s.commandsDisabled(w) {
+		return
+	}
+	if s.receiverOf(r) == "" {
+		unauthorized(w)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "requests": s.Commands.PendingRequests(), "now": time.Now().Unix()})
+}
+
+// answerRequest：POST /commands/requests/{id}（接收方），body {"decision":"approve"|"deny"}。只认第一次，之后或过期了 409。
+// 批准只是记账：真正的授权是 App 签好、发给 target 的那条指令。
+func (s *Server) answerRequest(w http.ResponseWriter, r *http.Request) {
+	if s.commandsDisabled(w) {
+		return
+	}
+	receiver := s.receiverOf(r)
+	if receiver == "" {
+		unauthorized(w)
+		return
+	}
+	var in struct {
+		Decision string `json:"decision"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxBody)).Decode(&in); err != nil || (in.Decision != "approve" && in.Decision != "deny") {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": `decision must be "approve" or "deny"`})
+		return
+	}
+	req, err := s.Commands.AnswerRequest(r.PathValue("id"), in.Decision == "approve", receiver)
+	switch {
+	case errors.Is(err, command.ErrNoRequest):
+		writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "error": err.Error()})
+		return
+	case err != nil:
+		writeJSON(w, http.StatusConflict, map[string]any{"ok": false, "error": err.Error(), "state": req.State})
+		return
+	}
+	s.log().Info("grant request answered", "id", req.ID, "caller", req.Caller, "state", req.State, "by", receiver)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "state": req.State})
+}
+
+// requestResult：GET /commands/requests/{id}?wait=秒（发申请的调用方），返回 {"state","expires","answered"}；
+// pending 时最多挂 wait 秒，一有结果立即返回。别的调用方取不到（404）。
+func (s *Server) requestResult(w http.ResponseWriter, r *http.Request) {
+	if s.commandsDisabled(w) {
+		return
+	}
+	caller := s.callerOf(r)
+	if caller == "" {
+		unauthorized(w)
+		return
+	}
+	id := r.PathValue("id")
+	req, ok := s.Commands.GetRequest(id)
+	if !ok || req.Caller != caller {
+		writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "error": command.ErrNoRequest.Error()})
+		return
+	}
+	wait, _ := strconv.Atoi(r.URL.Query().Get("wait"))
+	wait = min(max(wait, 0), maxInboxWait)
+	if wait > 0 && req.State == command.RequestPending {
+		_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(time.Duration(wait+10) * time.Second))
+		s.Commands.WaitRequest(r.Context(), id, time.Duration(wait)*time.Second)
+		if req, ok = s.Commands.GetRequest(id); !ok {
+			writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "error": command.ErrNoRequest.Error()})
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "state": req.State, "expires": req.Expires, "answered": req.Answered})
 }

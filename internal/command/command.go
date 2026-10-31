@@ -87,13 +87,17 @@ type Box struct {
 	seq       int64
 	changed   chan struct{}
 	listeners map[string]*Listener
+
+	requests   map[string]*Request // 提权申请，见 request.go
+	reqChanged chan struct{}
 }
 
 func New(now func() time.Time) *Box {
 	if now == nil {
 		now = time.Now
 	}
-	return &Box{now: now, changed: make(chan struct{}), listeners: map[string]*Listener{}}
+	return &Box{now: now, changed: make(chan struct{}), listeners: map[string]*Listener{},
+		requests: map[string]*Request{}, reqChanged: make(chan struct{})}
 }
 
 // Add 收下一条指令（调用方先 Check 过），编号并唤醒在等的 listen。
