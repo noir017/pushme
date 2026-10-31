@@ -3,6 +3,10 @@
 //	POST /hook/{token}  飞书自定义机器人兼容入口（acme.sh 的 feishu 钩子、quantlab 的 webhook 通道零改动接入）
 //	POST /send          原生入口：Authorization: Bearer <token>；body 为纯文本，或 JSON {"title","text"}
 //	GET  /inbox         收件箱长轮询（手机 App 收消息）：Authorization: Bearer <接收方 token>
+//	POST /approvals            发起审批（调用方 token），见 approvals.go
+//	GET  /approvals/{id}       发起方取结果，长轮询（调用方 token）
+//	GET  /approvals            还在等答复的审批（接收方 token）
+//	POST /approvals/{id}       手机答复（接收方 token）
 //	GET  /healthz
 //
 // 每个 token 对应一个调用方名，消息前自动加「[调用方]」；收件人固定，调用方不能指定。
@@ -23,6 +27,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/noir017/pushme/internal/approval"
 	"github.com/noir017/pushme/internal/inbox"
 )
 
@@ -53,7 +58,8 @@ type Server struct {
 	Receivers map[string]string // token → 接收方名（只能读收件箱，不能发）
 	Sender    Sender
 	Queue     Queue
-	Inbox     *inbox.Inbox // nil 表示不开收件箱
+	Inbox     *inbox.Inbox    // nil 表示不开收件箱
+	Approvals *approval.Store // nil 表示不开审批（要有接收方才有人答复）
 	Temporary func(error) bool
 	Limiter   *Limiter
 	Log       *slog.Logger
@@ -66,7 +72,28 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /hook/{token}", s.hook)
 	mux.HandleFunc("POST /send", s.send)
 	mux.HandleFunc("GET /inbox", s.inbox)
+	mux.HandleFunc("POST /approvals", s.createApproval)
+	mux.HandleFunc("GET /approvals/{id}", s.approvalResult)
+	mux.HandleFunc("GET /approvals", s.pendingApprovals)
+	mux.HandleFunc("POST /approvals/{id}", s.answerApproval)
 	return mux
+}
+
+// callerOf / receiverOf 从 Authorization: Bearer 头认出调用方 / 接收方，认不出返回空串。
+func (s *Server) callerOf(r *http.Request) string {
+	tok, found := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if !found {
+		return ""
+	}
+	return s.Tokens[strings.TrimSpace(tok)]
+}
+
+func (s *Server) receiverOf(r *http.Request) string {
+	tok, found := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if !found {
+		return ""
+	}
+	return s.Receivers[strings.TrimSpace(tok)]
 }
 
 func (s *Server) log() *slog.Logger {
@@ -192,9 +219,8 @@ func (s *Server) hook(w http.ResponseWriter, r *http.Request) {
 // ---- 原生入口 ----
 
 func (s *Server) send(w http.ResponseWriter, r *http.Request) {
-	tok, found := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-	caller, ok := s.Tokens[strings.TrimSpace(tok)]
-	if !found || !ok {
+	caller := s.callerOf(r)
+	if caller == "" {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"ok": false, "error": "missing or invalid bearer token"})
 		return
 	}
@@ -238,9 +264,8 @@ func (s *Server) inbox(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "error": "inbox disabled"})
 		return
 	}
-	tok, found := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-	receiver, ok := s.Receivers[strings.TrimSpace(tok)]
-	if !found || !ok {
+	receiver := s.receiverOf(r)
+	if receiver == "" {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{"ok": false, "error": "missing or invalid bearer token"})
 		return
 	}
@@ -324,19 +349,9 @@ func (s *Server) deliver(ctx context.Context, caller, title, text string) result
 	msg := format(caller, title, text)
 	lg := s.log().With("caller", caller, "bytes", len(msg))
 
-	if s.Limiter != nil {
-		allowed, notify := s.Limiter.Allow(caller)
-		if notify {
-			// 限流通知本身不过限流器，每个调用方每个窗口最多一条。
-			note := "调用方 " + caller + " 在 " + s.Limiter.Window.String() + " 内超过 " +
-				strconv.Itoa(s.Limiter.Burst) + " 条，后续消息被丢弃直到窗口恢复。"
-			s.toInbox("pushme", "限流", note)
-			go s.sendDetached("pushme", format("pushme", "限流", note))
-		}
-		if !allowed {
-			lg.Warn("rate limited")
-			return result{status: http.StatusTooManyRequests, err: "rate limited"}
-		}
+	if !s.allow(caller) {
+		lg.Warn("rate limited")
+		return result{status: http.StatusTooManyRequests, err: "rate limited"}
 	}
 	// 先存收件箱再发飞书：App 不用等飞书（最慢要等到 Timeout）
 	s.toInbox(caller, title, text)
@@ -362,6 +377,22 @@ func (s *Server) deliver(ctx context.Context, caller, title, text string) result
 	}
 	lg.Error("send failed (permanent)", "err", err)
 	return result{status: http.StatusBadGateway, err: "send failed: " + err.Error()}
+}
+
+// allow 过一次该调用方的限流（消息与审批共用一个桶）；本窗口第一次被限流时另推一条提醒。
+func (s *Server) allow(caller string) bool {
+	if s.Limiter == nil {
+		return true
+	}
+	allowed, notify := s.Limiter.Allow(caller)
+	if notify {
+		// 限流通知本身不过限流器，每个调用方每个窗口最多一条。
+		note := "调用方 " + caller + " 在 " + s.Limiter.Window.String() + " 内超过 " +
+			strconv.Itoa(s.Limiter.Burst) + " 条，后续消息被丢弃直到窗口恢复。"
+		s.toInbox("pushme", "限流", note)
+		go s.sendDetached("pushme", format("pushme", "限流", note))
+	}
+	return allowed
 }
 
 func (s *Server) sendDetached(caller, msg string) {
