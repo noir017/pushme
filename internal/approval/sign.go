@@ -46,12 +46,17 @@ var ErrBadSignature = errors.New("signature does not verify")
 
 // Verify 用手机公钥核对 a.Sig（base64 的 ASN.1 DER ECDSA，即 Android 的 SHA256withECDSA）。
 func Verify(pub *ecdsa.PublicKey, a Approval) error {
-	sig, err := base64.StdEncoding.DecodeString(a.Sig)
-	if err != nil || len(sig) == 0 {
+	return VerifySig(pub, Payload(a), a.Sig)
+}
+
+// VerifySig 核对 sig（base64 的 ASN.1 DER ECDSA）是不是手机对 payload 的签名。审批和指令共用。
+func VerifySig(pub *ecdsa.PublicKey, payload []byte, sig string) error {
+	raw, err := base64.StdEncoding.DecodeString(sig)
+	if err != nil || len(raw) == 0 {
 		return ErrBadSignature
 	}
-	digest := sha256.Sum256(Payload(a))
-	if !ecdsa.VerifyASN1(pub, digest[:], sig) {
+	digest := sha256.Sum256(payload)
+	if !ecdsa.VerifyASN1(pub, digest[:], raw) {
 		return ErrBadSignature
 	}
 	return nil

@@ -7,7 +7,7 @@
 - 每个调用方一个 token：消息自动加 `[调用方]` 前缀，可单独吊销，单独限流。
 - 飞书暂时发不出去时，消息写入本地队列并按退避重试，最多重试 24 小时，调用方不必自己处理重试。
 - 可选的**收件箱**：每条消息另存一份，手机 App 长轮询 `GET /inbox` 收、直接弹通知（例如 AutoAnything 的「aa助手」），不经飞书。
-- 可选的**审批（手机确认）**：脚本发起一条审批，手机上看完内容、用本机密钥签名批准，脚本用钉死的手机公钥验签（`pushme ask`）。pushme 只转发，伪造不了批准。
+- 可选的**审批（手机确认）**：脚本发起一条审批，手机上看完内容、用本机密钥签名批准，脚本用钉死的手机公钥验签（`pushme ask`）。反过来手机也能主动下签好名的指令（`pushme listen`）。pushme 只转发，伪造不了。
 - Go 标准库，零依赖；镜像约 10MB（distroless），内存 < 20MB；amd64 / arm64。
 
 ## 接口
@@ -101,6 +101,39 @@ token 只从环境变量读（不出现在进程参数里）。等待中连不�
 **配对**：手机公钥是 PEM（`-----BEGIN PUBLIC KEY-----`，SubjectPublicKeyInfo）。装到宿主后用 `pushme fingerprint approver.pub` 打印指纹（SubjectPublicKeyInfo DER 的 SHA-256 前 8 字节，如 `ab12 cd34 ef56 7890`），和 App 上显示的核对。**这一步要人自己做**：谁替你传公钥，谁就能换成他的。
 
 **手机 App** 在 [`android/`](android/README.md)：收消息、审批。CI 只出未签名的包，签名在你自己的机器上做。
+
+### 指令信箱（手机主动下指令）
+
+和审批反过来：手机主动给某个调用方下一条签好名的指令（例如「给 uniagent 开 unraid 1 小时提权」），调用方在宿主上跑 `pushme listen` 取走、验签、执行。
+同样配了 `PUSHME_RECEIVERS` 才有；同一把手机密钥，pushme 不验签。
+
+| 接口 | 鉴权 | 说明 |
+|---|---|---|
+| `POST /commands` | 接收方 | `{"to":"<调用方名>","id","issued","expires","body","sig"}`。`body` 一行 ≤200 字节；`expires - issued` ≤5 分钟；`to` 必须是已有调用方 |
+| `GET /commands?after=&wait=&label=` | 调用方 | 取发给自己的指令（长轮询，≤60 秒）；不带 `after` 只返回当前 `cursor`。顺带登记自己在线，`label` 是在 App 上显示的名字 |
+| `GET /commands/targets` | 接收方 | 3 分钟内来取过指令的调用方 `{"targets":[{"name","label","last_seen"}],"now"}`，App 据此列出能下指令的对象 |
+
+指令只放内存，几分钟就过期，pushme 重启就丢。签名内容（6 行，`\n` 分隔，末尾不带换行）：
+
+```
+pushme-command-v1
+<id>
+<to>
+<issued>
+<expires>
+<body>
+```
+
+**`pushme listen`**：
+
+```sh
+PUSHME_URL=http://<host>:8290 PUSHME_TOKEN=<调用方 token> \
+  pushme listen -to <本调用方名> -label <显示名> -pubkey /path/approver.pub -exec /usr/local/sbin/agent-grant -exec-arg _cmd
+```
+
+只执行收件方是 `-to`、签名对得上、没过期（签发不晚于现在 1 分钟、有效期 ≤5 分钟）、同一个 `id` 没执行过的指令；
+正文按空白切开接在 `-exec` / `-exec-arg` 后面执行（不经 shell），环境变量带 `PUSHME_CMD_ID`、`PUSHME_CMD_BY`。
+验不过的不执行，经 `/send` 推一条警告。一直跑，连不上 pushme 就退避重试，token 不对直接退出（交给 systemd / 看门狗重启）。
 
 ### `GET /healthz`
 

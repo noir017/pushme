@@ -7,6 +7,9 @@
 //	GET  /approvals/{id}       发起方取结果，长轮询（调用方 token）
 //	GET  /approvals            还在等答复的审批（接收方 token）
 //	POST /approvals/{id}       手机答复（接收方 token）
+//	POST /commands             手机投递签好名的指令（接收方 token），见 commands.go
+//	GET  /commands             调用方长轮询取发给自己的指令（调用方 token）
+//	GET  /commands/targets     最近在线、能下指令的调用方（接收方 token）
 //	GET  /healthz
 //
 // 每个 token 对应一个调用方名，消息前自动加「[调用方]」；收件人固定，调用方不能指定。
@@ -28,6 +31,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/noir017/pushme/internal/approval"
+	"github.com/noir017/pushme/internal/command"
 	"github.com/noir017/pushme/internal/inbox"
 )
 
@@ -60,6 +64,7 @@ type Server struct {
 	Queue     Queue
 	Inbox     *inbox.Inbox    // nil 表示不开收件箱
 	Approvals *approval.Store // nil 表示不开审批（要有接收方才有人答复）
+	Commands  *command.Box    // nil 表示不开指令信箱
 	Temporary func(error) bool
 	Limiter   *Limiter
 	Log       *slog.Logger
@@ -76,6 +81,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /approvals/{id}", s.approvalResult)
 	mux.HandleFunc("GET /approvals", s.pendingApprovals)
 	mux.HandleFunc("POST /approvals/{id}", s.answerApproval)
+	mux.HandleFunc("POST /commands", s.postCommand)
+	mux.HandleFunc("GET /commands", s.getCommands)
+	mux.HandleFunc("GET /commands/targets", s.commandTargets)
 	return mux
 }
 

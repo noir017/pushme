@@ -205,15 +205,20 @@ type httpError struct {
 func (e *httpError) Error() string { return fmt.Sprintf("HTTP %d: %s", e.status, e.msg) }
 
 func askCall(ctx context.Context, cfg askConfig, method, path string, body []byte, out any) error {
-	req, err := http.NewRequestWithContext(ctx, method, cfg.URL+path, bytes.NewReader(body))
+	return apiCall(ctx, cfg.Client, cfg.URL, cfg.Token, method, path, body, out)
+}
+
+// apiCall 发一个请求（Bearer token）、把 JSON 响应解进 out；非 200 返回 *httpError。ask 和 listen 共用。
+func apiCall(ctx context.Context, client *http.Client, base, token, method, path string, body []byte, out any) error {
+	req, err := http.NewRequestWithContext(ctx, method, base+path, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+cfg.Token)
+	req.Header.Set("Authorization", "Bearer "+token)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	res, err := cfg.Client.Do(req)
+	res, err := client.Do(req)
 	if err != nil {
 		return err
 	}
