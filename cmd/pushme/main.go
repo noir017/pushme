@@ -1,22 +1,19 @@
 // pushme：个人消息推送小服务。收 HTTP 请求，用飞书应用机器人发给一个固定收件人；
-// 配了接收方时，另把每条消息存进收件箱，供手机 App 长轮询取走，并开放审批（手机确认）接口。
+// 配了接收方时，另把每条消息存进收件箱，供手机 App 长轮询取走。
 //
 // 子命令：
 //
 //	pushme                      跑服务（下面的环境变量）
 //	pushme healthcheck          compose 的健康检查
-//	pushme ask …                发起一条审批并等手机答复、验签（给宿主上的脚本用，见 ask.go）
-//	pushme fingerprint <pem>    打印手机公钥的指纹，配对时核对
-//	pushme listen …             取手机发来的指令、验签后执行（给宿主上的脚本用，见 listen.go）
 //
 // 配置全走环境变量（部署时放 .env，600）：
 //
 //	FEISHU_APP_ID / FEISHU_APP_SECRET  飞书应用凭据（必填）
 //	PUSHME_TO                          收件人 user:ou_xxx / chat:oc_xxx / email:xxx（必填）
 //	PUSHME_TOKENS                      调用方清单 name:token,name:token（必填，token 至少 16 位）
-//	PUSHME_RECEIVERS                   收件箱的接收方清单 name:token,…（可选，留空不开收件箱和审批）
+//	PUSHME_RECEIVERS                   收件箱的接收方清单 name:token,…（可选，留空不开收件箱）
 //	PUSHME_LISTEN                      监听地址，默认 :8080
-//	PUSHME_DATA                        数据目录（放重试队列、收件箱与审批），默认 /data
+//	PUSHME_DATA                        数据目录（放重试队列和收件箱），默认 /data
 //	PUSHME_RATE                        每个调用方的限流，默认 30/10m
 //	FEISHU_BASE_URL                    默认 https://open.feishu.cn（测试时指向假服务）
 package main
@@ -36,8 +33,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/noir017/pushme/internal/approval"
-	"github.com/noir017/pushme/internal/command"
 	"github.com/noir017/pushme/internal/feishu"
 	"github.com/noir017/pushme/internal/inbox"
 	"github.com/noir017/pushme/internal/server"
@@ -53,12 +48,6 @@ func main() {
 		case "healthcheck":
 			// distroless 镜像里没有 curl：compose 的 healthcheck 用 `/pushme healthcheck`。
 			os.Exit(healthcheck())
-		case "ask":
-			os.Exit(askMain(os.Args[2:], os.Getenv, os.Stdout, os.Stderr))
-		case "fingerprint":
-			os.Exit(fingerprintMain(os.Args[2:], os.Stdout, os.Stderr))
-		case "listen":
-			os.Exit(listenMain(os.Args[2:], os.Getenv, os.Stdout, os.Stderr))
 		}
 	}
 	log := slog.New(slog.NewTextHandler(os.Stdout, nil))
@@ -182,14 +171,8 @@ func run(log *slog.Logger) error {
 		return err
 	}
 	var box *inbox.Inbox
-	var approvals *approval.Store
-	var commands *command.Box
 	if len(receivers) > 0 {
-		commands = command.New(nil)
 		if box, err = inbox.Open(filepath.Join(dataDir, "inbox.json"), nil); err != nil {
-			return err
-		}
-		if approvals, err = approval.Open(filepath.Join(dataDir, "approvals.json"), nil); err != nil {
 			return err
 		}
 	}
@@ -200,8 +183,6 @@ func run(log *slog.Logger) error {
 		Sender:    fc,
 		Queue:     sp,
 		Inbox:     box,
-		Approvals: approvals,
-		Commands:  commands,
 		Temporary: feishu.IsTemporary,
 		Limiter:   &server.Limiter{Burst: burst, Window: window},
 		Log:       log,

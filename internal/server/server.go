@@ -3,13 +3,6 @@
 //	POST /hook/{token}  飞书自定义机器人兼容入口（acme.sh 的 feishu 钩子、quantlab 的 webhook 通道零改动接入）
 //	POST /send          原生入口：Authorization: Bearer <token>；body 为纯文本，或 JSON {"title","text"}
 //	GET  /inbox         收件箱长轮询（手机 App 收消息）：Authorization: Bearer <接收方 token>
-//	POST /approvals            发起审批（调用方 token），见 approvals.go
-//	GET  /approvals/{id}       发起方取结果，长轮询（调用方 token）
-//	GET  /approvals            还在等答复的审批（接收方 token）
-//	POST /approvals/{id}       手机答复（接收方 token）
-//	POST /commands             手机投递签好名的指令（接收方 token），见 commands.go
-//	GET  /commands             调用方长轮询取发给自己的指令（调用方 token）
-//	GET  /commands/targets     最近在线、能下指令的调用方（接收方 token）
 //	GET  /healthz
 //
 // 每个 token 对应一个调用方名，消息前自动加「[调用方]」；收件人固定，调用方不能指定。
@@ -30,8 +23,6 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/noir017/pushme/internal/approval"
-	"github.com/noir017/pushme/internal/command"
 	"github.com/noir017/pushme/internal/inbox"
 )
 
@@ -62,9 +53,7 @@ type Server struct {
 	Receivers map[string]string // token → 接收方名（只能读收件箱，不能发）
 	Sender    Sender
 	Queue     Queue
-	Inbox     *inbox.Inbox    // nil 表示不开收件箱
-	Approvals *approval.Store // nil 表示不开审批（要有接收方才有人答复）
-	Commands  *command.Box    // nil 表示不开指令信箱
+	Inbox     *inbox.Inbox // nil 表示不开收件箱
 	Temporary func(error) bool
 	Limiter   *Limiter
 	Log       *slog.Logger
@@ -77,18 +66,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /hook/{token}", s.hook)
 	mux.HandleFunc("POST /send", s.send)
 	mux.HandleFunc("GET /inbox", s.inbox)
-	mux.HandleFunc("POST /approvals", s.createApproval)
-	mux.HandleFunc("GET /approvals/{id}", s.approvalResult)
-	mux.HandleFunc("GET /approvals", s.pendingApprovals)
-	mux.HandleFunc("POST /approvals/{id}", s.answerApproval)
-	mux.HandleFunc("POST /commands", s.postCommand)
-	mux.HandleFunc("GET /commands", s.getCommands)
-	mux.HandleFunc("GET /commands/targets", s.commandTargets)
-	mux.HandleFunc("POST /commands/status", s.commandStatus)
-	mux.HandleFunc("POST /commands/requests", s.createRequest)
-	mux.HandleFunc("GET /commands/requests", s.pendingRequests)
-	mux.HandleFunc("POST /commands/requests/{id}", s.answerRequest)
-	mux.HandleFunc("GET /commands/requests/{id}", s.requestResult)
 	return mux
 }
 
@@ -392,7 +369,7 @@ func (s *Server) deliver(ctx context.Context, caller, title, text string) result
 	return result{status: http.StatusBadGateway, err: "send failed: " + err.Error()}
 }
 
-// allow 过一次该调用方的限流（消息与审批共用一个桶）；本窗口第一次被限流时另推一条提醒。
+// allow 过一次该调用方的限流；本窗口第一次被限流时另推一条提醒。
 func (s *Server) allow(caller string) bool {
 	if s.Limiter == nil {
 		return true
